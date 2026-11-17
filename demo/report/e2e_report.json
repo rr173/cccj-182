@@ -1,0 +1,243 @@
+{
+  "schema": {
+    "columns": [
+      {
+        "name": "region",
+        "kind": "text",
+        "asc": true,
+        "nulls_first": true
+      },
+      {
+        "name": "ts",
+        "kind": "int64",
+        "asc": false,
+        "nulls_first": true
+      }
+    ],
+    "row_id_name": "row_id",
+    "max_key_bytes": null
+  },
+  "build": {
+    "rows": 9,
+    "bytes_written": 16384
+  },
+  "full_range_page_size_1": {
+    "delivered": [
+      [
+        [
+          "",
+          1
+        ],
+        "722d3034"
+      ],
+      [
+        [
+          "a",
+          null
+        ],
+        "722d3033"
+      ],
+      [
+        [
+          "a",
+          2
+        ],
+        "722d3031"
+      ],
+      [
+        [
+          "a",
+          1
+        ],
+        "722d3032"
+      ],
+      [
+        [
+          "a\u0000",
+          1
+        ],
+        "722d3035"
+      ],
+      [
+        [
+          "ab",
+          1
+        ],
+        "722d3036"
+      ],
+      [
+        [
+          "tie",
+          7
+        ],
+        "61"
+      ],
+      [
+        [
+          "tie",
+          7
+        ],
+        "6d"
+      ],
+      [
+        [
+          "tie",
+          7
+        ],
+        "7a"
+      ]
+    ],
+    "oracle_expected": [
+      [
+        [
+          "",
+          1
+        ],
+        "722d3034"
+      ],
+      [
+        [
+          "a",
+          null
+        ],
+        "722d3033"
+      ],
+      [
+        [
+          "a",
+          2
+        ],
+        "722d3031"
+      ],
+      [
+        [
+          "a",
+          1
+        ],
+        "722d3032"
+      ],
+      [
+        [
+          "a\u0000",
+          1
+        ],
+        "722d3035"
+      ],
+      [
+        [
+          "ab",
+          1
+        ],
+        "722d3036"
+      ],
+      [
+        [
+          "tie",
+          7
+        ],
+        "61"
+      ],
+      [
+        [
+          "tie",
+          7
+        ],
+        "6d"
+      ],
+      [
+        [
+          "tie",
+          7
+        ],
+        "7a"
+      ]
+    ],
+    "matches_oracle": true,
+    "page_count": 9,
+    "first_page_evidence": {
+      "eqp": [
+        {
+          "id": 3,
+          "parent": 0,
+          "notused": 0,
+          "detail": "SEARCH bytekey_index USING PRIMARY KEY (key>? AND key<?)"
+        }
+      ],
+      "used_index": true,
+      "rows_visited_inside_interval": 9,
+      "seek_bytecode": [
+        {
+          "addr": 5,
+          "opcode": "SeekGE",
+          "p1": 2,
+          "p2": 12,
+          "p3": 1,
+          "p4": "1",
+          "p5": 0,
+          "comment": null
+        }
+      ]
+    }
+  },
+  "narrow_query": {
+    "query": {
+      "shape": "prefix_range",
+      "prefix": [
+        [
+          "region",
+          "tie"
+        ]
+      ],
+      "range_column": "ts",
+      "lo": 7,
+      "hi": 7
+    },
+    "plan": {
+      "kind": "prefix_range",
+      "reverse_delivery": false,
+      "interval_count": 1,
+      "intervals": [
+        {
+          "lower_hex": "057469650000fb7ffffffffffffff8",
+          "upper_hex": "057469650000fb7ffffffffffffff9"
+        }
+      ],
+      "residual_checks": [
+        "none: null exclusion, endpoint openness and prefix equality are all expressed by the byte bounds; rows outside the intervals are never decoded"
+      ],
+      "query_spec": {
+        "hi": 7,
+        "hi_inclusive": true,
+        "lo": 7,
+        "lo_inclusive": true,
+        "prefix": [
+          [
+            "region",
+            "tie"
+          ]
+        ],
+        "range_column": "ts",
+        "shape": "prefix_range"
+      },
+      "prefix_columns": [
+        "region"
+      ],
+      "range_column": "ts"
+    },
+    "explain_query_plan": [
+      {
+        "id": 3,
+        "parent": 0,
+        "notused": 0,
+        "detail": "SEARCH bytekey_index USING PRIMARY KEY (key>? AND key<?)"
+      }
+    ],
+    "rows_visited": 3,
+    "rows_returned": 3,
+    "returned_row_ids": [
+      "61",
+      "6d",
+      "7a"
+    ]
+  }
+}
