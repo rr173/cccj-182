@@ -168,7 +168,17 @@ def _canonical_value(value) -> Any:
     if isinstance(value, tuple):
         return [_canonical_value(v) for v in value]
     if isinstance(value, list):
+        # Plain value lists, plus nested [column, value] prefix pairs whose
+        # second element may itself be bytes / null / a scalar.
         return [_canonical_value(v) for v in value]
+    if isinstance(value, dict):
+        # Already-canonical markers (e.g. produced while descending into a
+        # nested prefix list) are stable under re-canonicalization.
+        if set(value) == {"__bytekey_bytes__"} and isinstance(
+            value["__bytekey_bytes__"], str
+        ):
+            return dict(value)
+        raise QueryError("nested objects are not valid query values")
     if value is None or isinstance(value, (str, int, float)):
         return value
     raise QueryError(f"value of type {type(value).__name__} is not serializable")

@@ -7,6 +7,9 @@ Public API:
     plan_query, Interval, QueryPlan
     encode_cursor, decode_cursor
     QueryError, EncodingError, CursorError, BuildError
+    create_collection, open_collection, import_from_index, Collection
+    ApplyReceipt, SnapshotPage, SnapshotScanStats, HistoryStats, CollectionStatus
+    TokenError, CollectionError, BatchError, ConflictError, HistoryError
 """
 from .schema import Schema, Column
 from .encoding import (
@@ -34,6 +37,30 @@ from .db import (
     open_index,
     Page,
 )
+from .snapshot import (
+    TokenError,
+    SnapshotTicket,
+    CollectionCursor,
+    encode_snapshot_token,
+    decode_snapshot_token,
+    encode_collection_cursor,
+    decode_collection_cursor,
+)
+from .collection import (
+    Collection,
+    ApplyReceipt,
+    SnapshotPage,
+    SnapshotScanStats,
+    HistoryStats,
+    CollectionStatus,
+    CollectionError,
+    BatchError,
+    ConflictError,
+    HistoryError,
+    create_collection,
+    open_collection,
+    import_from_index,
+)
 
 __all__ = [
     "Schema",
@@ -59,4 +86,25 @@ __all__ = [
     "decode_cursor",
     "INT64_MIN",
     "INT64_MAX",
+    # Updatable collections + persistent snapshots
+    "Collection",
+    "ApplyReceipt",
+    "SnapshotPage",
+    "SnapshotScanStats",
+    "HistoryStats",
+    "CollectionStatus",
+    "TokenError",
+    "CollectionError",
+    "BatchError",
+    "ConflictError",
+    "HistoryError",
+    "create_collection",
+    "open_collection",
+    "import_from_index",
+    "SnapshotTicket",
+    "CollectionCursor",
+    "encode_snapshot_token",
+    "decode_snapshot_token",
+    "encode_collection_cursor",
+    "decode_collection_cursor",
 ]
