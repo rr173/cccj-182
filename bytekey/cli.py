@@ -2,10 +2,12 @@
 
 Plus the updatable-collection operations: ``collection-create``,
 ``collection-import``, ``apply``, ``snapshot-begin``, ``snapshot-release``,
-``snapshot-range``, ``collect-history`` and ``status``, and the named
+``snapshot-range``, ``collect-history`` and ``status``, the named
 secondary access index operations ``index-register``, ``index-advance``,
 ``index-status``, ``index-explain``, ``index-range``, ``index-cancel`` and
-``index-delete``.
+``index-delete``, and the persistent change-subscription operations
+``subscription-create``, ``subscription-list``, ``subscription-read``,
+``subscription-ack``, ``subscription-release`` and ``change-retention``.
 
 All JSON ``bytes`` values use the single-field object form ``{"__hex__": "..."}``
 on input and output (row_id, batch_id and every bytes-typed column alike).
@@ -22,6 +24,17 @@ from .db import build_index, open_index
 from .encoding import key_decode, key_encode
 from .planner import plan_query
 from .schema import Schema
+from .changes import (
+    ChangeError,
+    ChangeLogError,
+    ChangeRetentionError,
+    SubscriptionConflictError,
+    SubscriptionCursorError,
+    SubscriptionError,
+    SubscriptionNameConflict,
+    SubscriptionNotFoundError,
+    SubscriptionSkippedError,
+)
 from .collection import (
     BatchError,
     ConflictError,
@@ -427,6 +440,89 @@ def cmd_status(args: argparse.Namespace) -> int:
     return 0
 
 
+# ---------------------------------------------------------------------------
+# Persistent change subscriptions
+# ---------------------------------------------------------------------------
+
+def cmd_subscription_create(args: argparse.Namespace) -> int:
+    if args.start_gen is not None and args.from_head:
+        raise SubscriptionError(
+            "give either --start-gen or --from-head, not both"
+        )
+    with open_collection(args.collection) as coll:
+        info = coll.begin_subscription(
+            args.name,
+            start_gen=args.start_gen,
+            from_head=bool(args.from_head),
+        )
+        head = coll.status().head
+    _emit({"status": "subscription_created", "head": head, **info.to_dict()})
+    return 0
+
+
+def cmd_subscription_list(args: argparse.Namespace) -> int:
+    with open_collection(args.collection) as coll:
+        if args.name is None:
+            subs = coll.list_subscriptions()
+            _emit({
+                "status": "subscription_list",
+                "subscriptions": [s.to_dict() for s in subs],
+                "change_retain_from": coll.change_retention()["retain_from"],
+            })
+        else:
+            _emit({"status": "subscription_status",
+                   **coll.subscription_info(args.name).to_dict()})
+    return 0
+
+
+def cmd_subscription_read(args: argparse.Namespace) -> int:
+    with open_collection(args.collection) as coll:
+        page = coll.read_changes_page(
+            args.name, args.page_size, cursor_token=args.cursor
+        )
+        payload = page.to_dict()
+        payload["collection_id"] = page.collection_id
+        payload["row_id_name"] = coll.row_id_name
+    _emit({"status": "page", **payload})
+    return 0
+
+
+def cmd_subscription_ack(args: argparse.Namespace) -> int:
+    if args.cursor is not None and (
+        args.gen is not None or args.seq is not None
+    ):
+        raise SystemExit("give either --gen/--seq or --cursor, not both")
+    if args.cursor is None and (args.gen is None or args.seq is None):
+        raise SystemExit("acknowledgement requires --gen and --seq, or --cursor")
+    with open_collection(args.collection) as coll:
+        result = coll.acknowledge_changes(
+            args.name,
+            gen=args.gen,
+            seq=args.seq,
+            expected_gen=args.expected_gen,
+            expected_seq=args.expected_seq,
+            instance_id=args.instance_id,
+            cursor_token=args.cursor,
+        )
+    _emit({"status": "acknowledged", **result})
+    return 0
+
+
+def cmd_subscription_release(args: argparse.Namespace) -> int:
+    with open_collection(args.collection) as coll:
+        result = coll.release_subscription(
+            args.name, instance_id=args.instance_id
+        )
+    _emit({"status": "subscription_released", **result})
+    return 0
+
+
+def cmd_change_retention(args: argparse.Namespace) -> int:
+    with open_collection(args.collection) as coll:
+        _emit({"status": "change_retention", **coll.change_retention()})
+    return 0
+
+
 def cmd_explain_snapshot(args: argparse.Namespace) -> int:
     with open_collection(args.collection) as coll:
         query = _coerce_query(coll.schema, _load_json(args.query))
@@ -719,6 +815,61 @@ def build_parser() -> argparse.ArgumentParser:
     p = sub.add_parser("status", help="show collection generations, entries and snapshots")
     p.add_argument("--collection", required=True)
     p.set_defaults(func=cmd_status)
+
+    # -- persistent change subscriptions ------------------------------------
+    p = sub.add_parser("subscription-create",
+                       help="create a durable named change subscription")
+    p.add_argument("--collection", required=True)
+    p.add_argument("--name", required=True)
+    group = p.add_mutually_exclusive_group()
+    group.add_argument("--start-gen", type=int, default=None,
+                       help="first retained generation to deliver")
+    group.add_argument("--from-head", action="store_true",
+                       help="start at the current head generation")
+    p.set_defaults(func=cmd_subscription_create)
+
+    p = sub.add_parser("subscription-list",
+                       help="list subscriptions, or show one by name")
+    p.add_argument("--collection", required=True)
+    p.add_argument("--name", default=None)
+    p.set_defaults(func=cmd_subscription_list)
+
+    p = sub.add_parser("subscription-read",
+                       help="read exactly one bounded page of change events")
+    p.add_argument("--collection", required=True)
+    p.add_argument("--name", required=True)
+    p.add_argument("--page-size", type=int, required=True)
+    p.add_argument("--cursor", default=None,
+                   help="next_cursor from the previous page")
+    p.set_defaults(func=cmd_subscription_read)
+
+    p = sub.add_parser("subscription-ack",
+                       help="advance the durable acknowledged position")
+    p.add_argument("--collection", required=True)
+    p.add_argument("--name", required=True)
+    p.add_argument("--gen", type=int, default=None,
+                   help="acknowledged generation (with --seq)")
+    p.add_argument("--seq", type=int, default=None,
+                   help="acknowledged sequence (with --gen)")
+    p.add_argument("--cursor", default=None,
+                   help="acknowledge the page end named by this credential")
+    p.add_argument("--expected-gen", type=int, required=True)
+    p.add_argument("--expected-seq", type=int, required=True)
+    p.add_argument("--instance-id", default=None,
+                   help="refuse if the name now refers to another instance")
+    p.set_defaults(func=cmd_subscription_ack)
+
+    p = sub.add_parser("subscription-release",
+                       help="release a subscription and invalidate its cursors")
+    p.add_argument("--collection", required=True)
+    p.add_argument("--name", required=True)
+    p.add_argument("--instance-id", default=None)
+    p.set_defaults(func=cmd_subscription_release)
+
+    p = sub.add_parser("change-retention",
+                       help="show the retained change horizon and subscriptions")
+    p.add_argument("--collection", required=True)
+    p.set_defaults(func=cmd_change_retention)
 
     # -- named secondary access indexes -----------------------------------
     p = sub.add_parser("index-register",

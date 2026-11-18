@@ -21,6 +21,16 @@ and resume positions.
   hash of the resolved declaration, and the last secondary key / row_id /
   creation generation.  Main-order cursors and secondary cursors are not
   interchangeable.
+
+* A **subscription cursor** (``scur``) is the change-stream page credential.
+  It binds the collection identity and file path, the immutable subscription
+  *instance* id (a deleted and re-created same-name subscription can never
+  continue an old cursor), the subscription name, the acknowledgement
+  position the page was issued against, the exclusive page start position in
+  the ``(generation, sequence)`` change order, and the horizon generation the
+  page may not read past.  Because every field is deterministic, re-reading
+  the same page with the same credential reproduces the same events and the
+  same successor credential.
 """
 from __future__ import annotations
 
@@ -268,4 +278,82 @@ def decode_secondary_cursor(token: str, secret: str) -> SecondaryCursor:
     except (KeyError, TypeError, ValueError) as exc:
         raise TokenError(
             "secondary cursor token is missing or carries invalid fields"
+        ) from exc
+
+
+# ---------------------------------------------------------------------------
+# Change-subscription page cursors
+# ---------------------------------------------------------------------------
+
+@dataclass(frozen=True)
+class SubscriptionCursor:
+    collection_id: str
+    instance_id: str
+    name: str
+    ack_gen: int
+    ack_seq: int
+    start_gen: int       # exclusive page start in (gen, seq) order
+    start_seq: int
+    horizon: int         # highest generation this page may read
+    page_size: int
+    db_path: str
+
+
+def encode_subscription_cursor(
+    *,
+    secret: str,
+    collection_id: str,
+    instance_id: str,
+    name: str,
+    ack_gen: int,
+    ack_seq: int,
+    start_gen: int,
+    start_seq: int,
+    horizon: int,
+    page_size: int,
+    db_path: str,
+) -> str:
+    if not isinstance(page_size, int) or page_size <= 0:
+        raise TokenError("page_size must be a positive integer")
+    if not isinstance(instance_id, str) or not instance_id:
+        raise TokenError("subscription cursor requires an instance id")
+    if start_gen < 1 or start_seq < 0:
+        raise TokenError("subscription cursor requires a valid start position")
+    return _pack(
+        {
+            "v": TOKEN_VERSION,
+            "k": "scur",
+            "cid": collection_id,
+            "iid": instance_id,
+            "name": name,
+            "ag": int(ack_gen),
+            "as": int(ack_seq),
+            "sg": int(start_gen),
+            "ss": int(start_seq),
+            "hg": int(horizon),
+            "ps": int(page_size),
+            "path": db_path,
+        },
+        secret,
+    )
+
+
+def decode_subscription_cursor(token: str, secret: str) -> SubscriptionCursor:
+    body = _unpack(token, secret, "scur")
+    try:
+        return SubscriptionCursor(
+            collection_id=str(body["cid"]),
+            instance_id=str(body["iid"]),
+            name=str(body["name"]),
+            ack_gen=int(body["ag"]),
+            ack_seq=int(body["as"]),
+            start_gen=int(body["sg"]),
+            start_seq=int(body["ss"]),
+            horizon=int(body["hg"]),
+            page_size=int(body["ps"]),
+            db_path=str(body["path"]),
+        )
+    except (KeyError, TypeError, ValueError) as exc:
+        raise TokenError(
+            "subscription cursor token is missing or carries invalid fields"
         ) from exc

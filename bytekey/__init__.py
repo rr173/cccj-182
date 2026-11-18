@@ -10,6 +10,12 @@ Public API:
     create_collection, open_collection, import_from_index, Collection
     ApplyReceipt, SnapshotPage, SnapshotScanStats, HistoryStats, CollectionStatus
     TokenError, CollectionError, BatchError, ConflictError, HistoryError
+    ChangeEvent, ChangeBatchMarker, ChangePage, ChangeReadStats,
+    SubscriptionInfo, SubscriptionCursor, encode_subscription_cursor,
+    decode_subscription_cursor, ChangeError, SubscriptionError,
+    SubscriptionNotFoundError, SubscriptionNameConflict,
+    SubscriptionConflictError, SubscriptionCursorError,
+    SubscriptionSkippedError, ChangeRetentionError, ChangeLogError
     SecondaryDeclaration, IndexColumn, IndexPage, IndexScanStats,
     IndexBuildStatus, IndexInfo, CoverageError, IndexCursorError
     JoinSource, Join, JoinPage, JoinRow, JoinSide, JoinPageStats,
@@ -48,12 +54,15 @@ from .snapshot import (
     SnapshotTicket,
     CollectionCursor,
     SecondaryCursor,
+    SubscriptionCursor,
     encode_snapshot_token,
     decode_snapshot_token,
     encode_collection_cursor,
     decode_collection_cursor,
     encode_secondary_cursor,
     decode_secondary_cursor,
+    encode_subscription_cursor,
+    decode_subscription_cursor,
 )
 from .secondary import (
     BUILDING,
@@ -93,6 +102,24 @@ from .collection import (
     create_collection,
     open_collection,
     import_from_index,
+)
+from .changes import (
+    ChangeBatchMarker,
+    ChangeError,
+    ChangeEvent,
+    ChangeLogError,
+    ChangePage,
+    ChangeReadStats,
+    ChangeRetentionError,
+    SubscriptionConflictError,
+    SubscriptionCursorError,
+    SubscriptionError,
+    SubscriptionInfo,
+    SubscriptionNameConflict,
+    SubscriptionNotFoundError,
+    SubscriptionSkippedError,
+    encode_image,
+    decode_image,
 )
 from .join import (
     FULL,
@@ -161,6 +188,26 @@ __all__ = [
     "decode_snapshot_token",
     "encode_collection_cursor",
     "decode_collection_cursor",
+    # Persistent change subscriptions
+    "ChangeEvent",
+    "ChangeBatchMarker",
+    "ChangePage",
+    "ChangeReadStats",
+    "ChangeError",
+    "ChangeLogError",
+    "ChangeRetentionError",
+    "SubscriptionInfo",
+    "SubscriptionError",
+    "SubscriptionNotFoundError",
+    "SubscriptionNameConflict",
+    "SubscriptionConflictError",
+    "SubscriptionCursorError",
+    "SubscriptionSkippedError",
+    "SubscriptionCursor",
+    "encode_subscription_cursor",
+    "decode_subscription_cursor",
+    "encode_image",
+    "decode_image",
     # Named secondary access indexes
     "IndexPage",
     "IndexScanStats",

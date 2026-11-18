@@ -29,16 +29,46 @@ Small corrections never touch the whole table: an apply writes only the
 superseded/inserted entries of the rows named in the batch -- O(batch) index
 work, no full-table scan, no per-generation index copy.
 
+Persistent change stream (outbox)
+---------------------------------
+
+The change stream uses an **outbox written by the same transaction as the
+main version rows, head and receipt**.  In the publish step each state-
+changing operation appends one row to ``bytekey_changes`` carrying the full
+before and after business tuples (canonical type-tagged JSON; SQL ``NULL``
+for an absent side) and every successful generation appends one row to
+``bytekey_change_batches`` even when it has zero events.  This choice is what
+makes the required semantics cheap and exact:
+
+* the before image is captured while the superseded version is still known,
+  so no later reconstruction from ``(cgen, dgen)`` is needed and history
+  collection of main versions never destroys a subscriber's required old
+  value;
+* an empty / all-no-op generation still has a durable position (the batch
+  marker), so consumers can cross it;
+* the outbox is invisible until commit and rolls back with the batch, so a
+  rejected validation leaves no change record and a lost reply is replayed
+  from the receipt without appending a second generation;
+* paging is a primary-key seek on ``(gen, seq)`` -- bounded memory, no scan
+  from generation one.
+
+``seq`` is assigned in the deterministic processing order (row_id ascending)
+so replaying a page reproduces the exact event sequence.  Consumers
+(subscriptions) are independent, durable cursor + acknowledgement positions;
+``collect_history`` reclaims main versions, snapshots and change rows under
+separate eligibility rules.
+
 Transactions, idempotency and crash safety
 ------------------------------------------
 
-Each writer action (apply / snapshot begin / release / collect) takes
-``BEGIN IMMEDIATE``, so all commits have one total serialization order across
-processes.  A batch is fully validated into an on-disk staging table inside
-the transaction before any collection row changes; any malformed source, bad
-type, duplicate identity or ``expected_head`` mismatch rolls back and leaves
-no partial update and no receipt (the batch_id stays free).  The receipt
-table makes successful requests safely re-sendable.
+Each writer action (apply / snapshot begin, release, collect / subscription
+create, release, read-position and acknowledge) takes ``BEGIN IMMEDIATE``, so
+all commits have one total serialization order across processes.  A batch is
+fully validated into an on-disk staging table inside the transaction before
+any collection row changes; any malformed source, bad type, duplicate
+identity or ``expected_head`` mismatch rolls back and leaves no partial
+update, no receipt and no change event (the batch_id stays free).  The
+receipt table makes successful requests safely re-sendable.
 
 History collection
 ------------------
@@ -48,7 +78,11 @@ physically deletes exactly the dead entries no retained generation and no
 active snapshot can read.  Active snapshot tokens pin every entry their
 generation can see; only after the last protecting token is released can a
 later collection remove them.  Secondary-index versions and journal rows obey
-the same rule, and an in-flight build protects its own inputs.
+the same rule, and an in-flight build protects its own inputs.  Change events
+and batch markers below ``R`` are removed only when no active subscription
+still needs them (its acknowledgement position is at or beyond them); the
+earliest generation a new subscription may start from advances over the
+deleted prefix.
 
 Named secondary access indexes
 ------------------------------
@@ -71,6 +105,31 @@ import sqlite3
 from dataclasses import dataclass, field
 from typing import Any, Callable, Iterable, Mapping, Sequence
 
+from .changes import (
+    CHANGE_BATCH_TABLE,
+    CHANGE_TABLE,
+    EVENT_KIND_DELETE,
+    EVENT_KIND_INSERT,
+    EVENT_KIND_UPDATE,
+    SUBSCRIPTION_TABLE,
+    ChangeBatchMarker,
+    ChangeError,
+    ChangeEvent,
+    ChangeLogError,
+    ChangePage,
+    ChangeReadStats,
+    ChangeRetentionError,
+    SubscriptionConflictError,
+    SubscriptionCursorError,
+    SubscriptionError,
+    SubscriptionInfo,
+    SubscriptionNameConflict,
+    SubscriptionNotFoundError,
+    SubscriptionSkippedError,
+    decode_image,
+    encode_image,
+    typed_json_value,
+)
 from .encoding import EncodingError, key_decode, key_encode
 from .planner import Interval, QueryPlan, plan_query
 from .schema import Schema
@@ -98,9 +157,11 @@ from .snapshot import (
     decode_collection_cursor,
     decode_secondary_cursor,
     decode_snapshot_token,
+    decode_subscription_cursor,
     encode_collection_cursor,
     encode_secondary_cursor,
     encode_snapshot_token,
+    encode_subscription_cursor,
 )
 
 META_TABLE = "bytekey_meta"
@@ -108,8 +169,10 @@ KV_TABLE = "bytekey_kv"
 RECEIPT_TABLE = "bytekey_receipts"
 SNAPSHOT_TABLE = "bytekey_snapshots"
 STAGING_TABLE = "bytekey_staging"
-COLLECTION_FORMAT = "bytekey-collection/v2"
+COLLECTION_FORMAT = "bytekey-collection/v3"
+LEGACY_SECONDARY_FORMAT = "bytekey-collection/v2"
 LEGACY_COLLECTION_FORMAT = "bytekey-collection/v1"
+LEGACY_FORMATS = (LEGACY_COLLECTION_FORMAT, LEGACY_SECONDARY_FORMAT)
 APPLICATION_ID = 0x6279746B  # 'bytk', shared with the static index
 DIGEST_VERSION = "bytekey-batch-digest/v1"
 BUSY_TIMEOUT_MS = 10000
@@ -188,6 +251,11 @@ class HistoryStats:
     head: int
     secondary_entries_removed: int = 0
     queue_entries_removed: int = 0
+    change_events_removed: int = 0
+    change_batches_removed: int = 0
+    change_retain_from: int = 0
+    previous_change_retain_from: int = 0
+    active_subscriptions: int = 0
 
     def to_dict(self) -> dict:
         return {
@@ -197,6 +265,13 @@ class HistoryStats:
             "main_entries_removed": self.entries_removed,
             "secondary_entries_removed": self.secondary_entries_removed,
             "queue_entries_removed": self.queue_entries_removed,
+            # Change-stream reclamation, reported separately from the main
+            # version count so callers can tell what was really deleted.
+            "change_events_removed": self.change_events_removed,
+            "change_batches_removed": self.change_batches_removed,
+            "change_retain_from": self.change_retain_from,
+            "previous_change_retain_from": self.previous_change_retain_from,
+            "active_subscriptions": self.active_subscriptions,
             "active_snapshots": self.active_snapshots,
             "head": self.head,
         }
@@ -336,6 +411,10 @@ class CollectionStatus:
     receipt_count: int
     active_snapshots: list[dict] = field(default_factory=list)
     indexes: list[dict] = field(default_factory=list)
+    change_retain_from: int = 1
+    change_head_count: int = 0
+    change_event_count: int = 0
+    subscriptions: list[dict] = field(default_factory=list)
 
     def to_dict(self) -> dict:
         return {
@@ -351,6 +430,13 @@ class CollectionStatus:
             "receipt_count": self.receipt_count,
             "active_snapshots": list(self.active_snapshots),
             "indexes": list(self.indexes),
+            # Change-stream retention: the earliest generation a NEW
+            # subscription may start from, and how many generations/events are
+            # still stored (not how many ever existed).
+            "change_retain_from": self.change_retain_from,
+            "change_batches_retained": self.change_head_count,
+            "change_events_retained": self.change_event_count,
+            "subscriptions": list(self.subscriptions),
         }
 
 
@@ -359,23 +445,11 @@ class CollectionStatus:
 # ---------------------------------------------------------------------------
 
 def _typed_json_value(value: Any) -> dict:
-    """Type-tagged canonical JSON value.
-
-    The tag makes null, empty text, empty bytes, bool and integers
-    non-confusable in the digest, even when their plain JSON spelling would
-    collide (``""`` vs ``""``) or be ambiguous (``true`` vs ``1``).
-    """
-    if value is None:
-        return {"t": "null"}
-    if isinstance(value, bool):
-        return {"t": "bool", "v": value}
-    if isinstance(value, int):
-        return {"t": "i64", "v": str(value)}
-    if isinstance(value, str):
-        return {"t": "txt", "v": value}
-    if isinstance(value, (bytes, bytearray)):
-        return {"t": "bin", "v": bytes(value).hex()}
-    raise BatchError(f"value of type {type(value).__name__} is not digestible")
+    """Type-tagged canonical JSON value (shared with the change outbox)."""
+    try:
+        return typed_json_value(value)
+    except ValueError as exc:
+        raise BatchError(str(exc)) from None
 
 
 def _canonical_op_json(kind: str, rid: bytes, values: Sequence | None) -> bytes:
@@ -450,6 +524,51 @@ def _create_schema_objects(conn: sqlite3.Connection) -> None:
         "canon BLOB NOT NULL, PRIMARY KEY(batch_id, rid)) WITHOUT ROWID"
     )
     _ensure_secondary_schema(conn)
+    _ensure_change_schema(conn)
+
+
+def _ensure_change_schema(conn: sqlite3.Connection) -> None:
+    """Create the change-stream objects if absent (idempotent, recoverable).
+
+    Used both by a fresh create and by the in-place format upgrade, so an
+    interrupted migration simply completes on the next open.  A pre-existing
+    (legacy) collection gets empty change tables and a change-retention
+    boundary at its current head: subscriptions may start at the upgrade
+    head, and no event is ever fabricated for an older original batch.
+    """
+    conn.execute(
+        f"CREATE TABLE IF NOT EXISTS {CHANGE_TABLE} ("
+        "gen INTEGER NOT NULL, seq INTEGER NOT NULL, rid BLOB NOT NULL, "
+        "kind TEXT NOT NULL, before_json TEXT, after_json TEXT, "
+        "PRIMARY KEY(gen, seq)) WITHOUT ROWID"
+    )
+    conn.execute(
+        f"CREATE TABLE IF NOT EXISTS {CHANGE_BATCH_TABLE} ("
+        "gen INTEGER PRIMARY KEY, batch_id BLOB NOT NULL, digest TEXT NOT NULL, "
+        "event_count INTEGER NOT NULL, cum_events INTEGER NOT NULL) WITHOUT ROWID"
+    )
+    conn.execute(
+        f"CREATE UNIQUE INDEX IF NOT EXISTS bytekey_change_batch_id "
+        f"ON {CHANGE_BATCH_TABLE}(batch_id)"
+    )
+    # One *active* subscription per name; a released instance keeps its row
+    # (and identity) so old cursors are always rejected, while the name is
+    # free for a new instance with a fresh id.  A position is ``(gen, seq)``
+    # where ``seq`` is the last delivered event in ``gen``; ``(g, 0)`` means
+    # nothing of ``g`` yet.  A new subscription starts acknowledged and read
+    # at ``(start_gen, 0)``, so its first page begins at ``start_gen``.
+    conn.execute(
+        f"CREATE TABLE IF NOT EXISTS {SUBSCRIPTION_TABLE} ("
+        "instance_id TEXT PRIMARY KEY, name TEXT NOT NULL, status TEXT NOT NULL, "
+        "start_gen INTEGER NOT NULL, "
+        "ack_gen INTEGER NOT NULL, ack_seq INTEGER NOT NULL, "
+        "read_gen INTEGER NOT NULL, read_seq INTEGER NOT NULL, "
+        "created_seq INTEGER NOT NULL) WITHOUT ROWID"
+    )
+    conn.execute(
+        f"CREATE UNIQUE INDEX IF NOT EXISTS bytekey_sub_name_active "
+        f"ON {SUBSCRIPTION_TABLE}(name) WHERE status = 'active'"
+    )
 
 
 def _ensure_secondary_schema(conn: sqlite3.Connection) -> None:
@@ -509,16 +628,48 @@ def _migrate_collection(conn: sqlite3.Connection, fmt: str) -> None:
     """Recoverably upgrade a legacy collection in place.
 
     Collection identity, head, receipts, snapshots and every version row are
-    untouched; only new (initially empty) secondary-index objects are added
-    and the format marker is advanced.
+    untouched; only new (initially empty) secondary-index and change-stream
+    objects are added and the format marker is advanced.
+
+    A legacy collection has no original change events, so the change-retention
+    floor is set to the *upgrade-time head*: subscriptions may start there
+    (and read later generations) but the collection never pretends to
+    reconstruct pre-upgrade batches.  The floor is only written when absent,
+    so an interrupted migration that already added the tables simply
+    completes on the next open.
     """
     if fmt == COLLECTION_FORMAT:
         return
-    if fmt != LEGACY_COLLECTION_FORMAT:
+    if fmt not in LEGACY_FORMATS:
         raise CollectionError(f"unsupported collection format {fmt!r}")
     try:
         conn.execute("BEGIN IMMEDIATE")
+        head = int(
+            conn.execute(
+                f"SELECT value FROM {META_TABLE} WHERE name = 'head'"
+            ).fetchone()[0]
+        )
         _ensure_secondary_schema(conn)
+        _ensure_change_schema(conn)
+        # Pre-upgrade batches were never recorded.  A subscription may start
+        # at the upgrade *head* (the boundary generation): we store a
+        # zero-event marker for it so that position is crossable, but never
+        # claim any of its original row events.  The marker's batch_id is the
+        # empty blob, which no real apply can carry, and its digest names the
+        # upgrade boundary explicitly.  Idempotent, so an interrupted upgrade
+        # completes on the next open.
+        if head >= 1:
+            conn.execute(
+                f"INSERT OR IGNORE INTO {CHANGE_BATCH_TABLE}"
+                "(gen, batch_id, digest, event_count, cum_events) "
+                "VALUES (?, ?, ?, 0, 0)",
+                (head, b"", "bytekey-upgrade-boundary/v1"),
+            )
+        conn.execute(
+            f"INSERT OR IGNORE INTO {META_TABLE}(name, value) "
+            "VALUES ('change_retain_from', ?)",
+            (str(head if head >= 1 else 1),),
+        )
         conn.execute(
             f"UPDATE {META_TABLE} SET value = ? WHERE name = 'format'",
             (COLLECTION_FORMAT,),
@@ -559,6 +710,10 @@ def create_collection(path: str, schema: Schema) -> str:
                 "head": "0",
                 "retain_from": "0",
                 "snapshot_seq": "0",
+                # Generation 1 is the first publishable generation and the
+                # first position a subscription may start from.  It is never
+                # consumed while no change row below it exists.
+                "change_retain_from": "1",
             }
             conn.execute("BEGIN")
             conn.executemany(
@@ -689,9 +844,11 @@ class Collection:
             raise CollectionError(f"not a bytekey database: {path}") from exc
         meta = dict(meta_rows)
         fmt = meta.get("format")
-        if fmt == LEGACY_COLLECTION_FORMAT:
-            # Recoverable in-place upgrade: identity, head, receipts and
-            # snapshots are preserved; only empty secondary objects are added.
+        if fmt in LEGACY_FORMATS:
+            # Recoverable in-place upgrade: identity, head, receipts,
+            # snapshots and version rows are preserved; empty secondary and
+            # change-stream objects are added and the change floor is pinned to
+            # the upgrade head.
             try:
                 _migrate_collection(self.writer, fmt)
             except BaseException:
@@ -938,6 +1095,24 @@ class Collection:
             new_head = head + 1
             applied = 0
             noop = 0
+            last_cum = self.writer.execute(
+                f"SELECT cum_events FROM {CHANGE_BATCH_TABLE} "
+                "ORDER BY gen DESC LIMIT 1"
+            ).fetchone()
+            cum_events = 0 if last_cum is None else last_cum[0]
+            event_seq = 0
+
+            def record_change(kind: str, rid: bytes,
+                               before: tuple | None, after: tuple | None) -> None:
+                nonlocal event_seq
+                event_seq += 1
+                self.writer.execute(
+                    f"INSERT INTO {CHANGE_TABLE}"
+                    "(gen, seq, rid, kind, before_json, after_json) "
+                    "VALUES (?, ?, ?, ?, ?, ?)",
+                    (new_head, event_seq, rid, kind,
+                     encode_image(before), encode_image(after)),
+                )
             # Building secondary indexes must cover everything published from
             # their start generation B on.  The journal is written in this
             # very transaction (same commit as the main version + receipt),
@@ -1037,12 +1212,14 @@ class Collection:
                     if live is None:
                         noop += 1  # deleting a missing identity is a success no-op
                         continue
+                    old_values, _ = key_decode(self.schema, live[0])
                     self.writer.execute(
                         f"UPDATE {KV_TABLE} SET dgen = ? WHERE rid = ? AND dgen IS NULL",
                         (new_head, rid),
                     )
+                    # One event: complete before image, explicit absent after.
+                    record_change(EVENT_KIND_DELETE, rid, old_values, None)
                     if building_indexes or ready_indexes:
-                        old_values, _ = key_decode(self.schema, live[0])
                         for iid, decl in building_indexes:
                             journal_close(iid, decl, live[0], rid, live[1],
                                           old_values, new_head)
@@ -1057,17 +1234,19 @@ class Collection:
                             "(key, rid, cgen, dgen) VALUES (?, ?, ?, NULL)",
                             (encoded_key, rid, new_head),
                         )
+                        # Insert: explicit absent before, complete after image.
+                        new_values, _ = key_decode(self.schema, encoded_key)
+                        record_change(EVENT_KIND_INSERT, rid, None, new_values)
                         if building_indexes or ready_indexes:
-                            values, _ = key_decode(self.schema, encoded_key)
                             for iid, decl in building_indexes:
                                 journal_open(iid, decl, encoded_key, rid,
-                                             values, new_head)
+                                             new_values, new_head)
                             for iid, decl in ready_indexes:
                                 ready_insert(iid, decl, encoded_key, rid,
-                                             values, new_head)
+                                             new_values, new_head)
                         applied += 1
                     elif live[0] == encoded_key:
-                        noop += 1  # identical full replacement
+                        noop += 1  # identical full replacement: no event
                     else:
                         self.writer.execute(
                             f"UPDATE {KV_TABLE} SET dgen = ? WHERE rid = ? "
@@ -1079,9 +1258,12 @@ class Collection:
                             "(key, rid, cgen, dgen) VALUES (?, ?, ?, NULL)",
                             (encoded_key, rid, new_head),
                         )
+                        # Move/full replacement: complete before and after.
+                        old_values, _ = key_decode(self.schema, live[0])
+                        new_values, _ = key_decode(self.schema, encoded_key)
+                        record_change(EVENT_KIND_UPDATE, rid, old_values,
+                                      new_values)
                         if building_indexes or ready_indexes:
-                            old_values, _ = key_decode(self.schema, live[0])
-                            new_values, _ = key_decode(self.schema, encoded_key)
                             for iid, decl in building_indexes:
                                 journal_close(iid, decl, live[0], rid, live[1],
                                               old_values, new_head)
@@ -1107,6 +1289,18 @@ class Collection:
                 "applied_count, noop_count) VALUES (?, ?, ?, ?, ?, ?, ?)",
                 (batch_id, new_head, expected_head, digest_hex,
                  op_count, applied, noop),
+            )
+            # One marker per successful generation -- even a zero-event one --
+            # in the same commit as the receipt, head and version rows.  This
+            # is the durable position a consumer can cross without events and
+            # the idempotency anchor that stops a replayed batch from
+            # appending a second generation to the change stream.
+            self.writer.execute(
+                f"INSERT INTO {CHANGE_BATCH_TABLE}"
+                "(gen, batch_id, digest, event_count, cum_events) "
+                "VALUES (?, ?, ?, ?, ?)",
+                (new_head, batch_id, digest_hex, event_seq,
+                 cum_events + event_seq),
             )
             self._set_meta("head", new_head)
             self.writer.execute(
@@ -2259,6 +2453,708 @@ class Collection:
             "page_size": page_size,
         }
 
+    # -- change subscriptions ---------------------------------------------
+
+    def _change_floor(self) -> int:
+        """Earliest generation a *new* subscription may start from.
+
+        This is the durable metadata floor; it only advances when history
+        collection has physically removed a fully-consumed prefix of change
+        records.  Equality with ``head + 1`` means nothing is retained.
+        """
+        row = self.reader.execute(
+            f"SELECT value FROM {META_TABLE} WHERE name = 'change_retain_from'"
+        ).fetchone()
+        head = self._meta_int_reader("head")
+        oldest = self.reader.execute(
+            f"SELECT MIN(gen) FROM {CHANGE_BATCH_TABLE}"
+        ).fetchone()[0]
+        if row is not None:
+            floor = int(row[0])
+        elif oldest is not None:
+            # Defensive: without metadata, trust only what is still stored.
+            floor = int(oldest)
+        else:
+            floor = head + 1
+        # If no marker at or above the floor survive, nothing is retained.
+        if oldest is None:
+            floor = max(floor, head + 1)
+        return floor
+
+    def _subscription_row(self, name: str, *, active_only: bool = True) -> tuple:
+        where = " AND status = 'active'" if active_only else ""
+        row = self.reader.execute(
+            f"SELECT instance_id, name, status, start_gen, ack_gen, ack_seq, "
+            f"read_gen, read_seq, created_seq FROM {SUBSCRIPTION_TABLE} "
+            f"WHERE name = ?{where}",
+            (name,),
+        ).fetchone()
+        if row is None:
+            if active_only:
+                raise SubscriptionNotFoundError(
+                    f"no active change subscription named {name!r}"
+                )
+            raise SubscriptionNotFoundError(
+                f"change subscription {name!r} does not exist"
+            )
+        return row
+
+    @staticmethod
+    def _subscription_info(row: tuple) -> SubscriptionInfo:
+        (iid, name, status, start_gen, ag, asq, rg, rsq, created) = row
+        return SubscriptionInfo(
+            name=name,
+            instance_id=iid,
+            status=status,
+            start_gen=start_gen,
+            ack_gen=ag,
+            ack_seq=asq,
+            read_gen=rg,
+            read_seq=rsq,
+            created_seq=created,
+        )
+
+    def begin_subscription(
+        self,
+        name: str,
+        *,
+        start_gen: int | None = None,
+        from_head: bool = False,
+    ) -> SubscriptionInfo:
+        """Create a durable subscription from an explicit or current position.
+
+        ``start_gen`` is the first generation to deliver (a retained
+        generation, or ``head + 1`` for "only future changes"); ``from_head``
+        instead starts *at* the current head (the first page includes the
+        generation already published, if its events are retained).  Names are
+        unique among active subscriptions and a released name frees it for a
+        brand-new instance whose cursors never interoperate with the old one.
+        """
+        if not isinstance(name, str) or not name:
+            raise SubscriptionError("subscription name must be a non-empty string")
+        if from_head and start_gen is not None:
+            raise SubscriptionError(
+                "give either an explicit start generation or from_head, not both"
+            )
+        if start_gen is not None and (
+            isinstance(start_gen, bool) or not isinstance(start_gen, int)
+        ):
+            raise SubscriptionError("start generation must be an integer or None")
+        self._begin_write()
+        try:
+            head = self._meta_int("head")
+            floor = int(
+                self.writer.execute(
+                    f"SELECT value FROM {META_TABLE} "
+                    "WHERE name = 'change_retain_from'"
+                ).fetchone()[0]
+            )
+            if from_head:
+                # "From the current head": consume the generation already
+                # published.  With no generation yet, start at the first one.
+                target = head if head >= 1 else 1
+            elif start_gen is None:
+                target = head + 1
+            else:
+                target = start_gen
+            if target < floor:
+                raise ChangeRetentionError(
+                    f"start generation {target} is below the retained change "
+                    f"boundary {min(floor, head + 1)}; its events have been "
+                    "reclaimed and no new subscription may begin there"
+                )
+            if target > head + 1:
+                raise ChangeRetentionError(
+                    f"start generation {target} is beyond the next publishable "
+                    f"generation (current head {head})"
+                )
+            active = self.writer.execute(
+                f"SELECT instance_id FROM {SUBSCRIPTION_TABLE} "
+                "WHERE name = ? AND status = 'active'",
+                (name,),
+            ).fetchone()
+            if active is not None:
+                raise SubscriptionNameConflict(
+                    f"an active change subscription named {name!r} already "
+                    f"exists (instance {active[0]}); release it before reusing "
+                    "the name"
+                )
+            created = self.writer.execute(
+                f"SELECT COALESCE(MAX(created_seq), 0) + 1 FROM {SUBSCRIPTION_TABLE}"
+            ).fetchone()[0]
+            instance_id = secrets.token_hex(16)
+            # Acknowledged and read frontiers start together, just before the
+            # start generation: nothing has been read, so nothing can yet be
+            # acknowledged.
+            self.writer.execute(
+                f"INSERT INTO {SUBSCRIPTION_TABLE}"
+                "(instance_id, name, status, start_gen, ack_gen, ack_seq, "
+                "read_gen, read_seq, created_seq) "
+                "VALUES (?, ?, 'active', ?, ?, 0, ?, 0, ?)",
+                (instance_id, name, target, target, target, created),
+            )
+            self._commit()
+        except BaseException:
+            self._rollback()
+            raise
+        return SubscriptionInfo(
+            name=name,
+            instance_id=instance_id,
+            status="active",
+            start_gen=target,
+            ack_gen=target,
+            ack_seq=0,
+            read_gen=target,
+            read_seq=0,
+            created_seq=created,
+        )
+
+    def list_subscriptions(self) -> list[SubscriptionInfo]:
+        rows = self.reader.execute(
+            f"SELECT instance_id, name, status, start_gen, ack_gen, ack_seq, "
+            f"read_gen, read_seq, created_seq FROM {SUBSCRIPTION_TABLE} "
+            "WHERE status = 'active' ORDER BY created_seq"
+        ).fetchall()
+        return [self._subscription_info(row) for row in rows]
+
+    def subscription_info(self, name: str) -> SubscriptionInfo:
+        return self._subscription_info(self._subscription_row(name))
+
+    def release_subscription(self, name: str, *,
+                             instance_id: str | None = None) -> dict:
+        """Release a subscription; its cursors stop working immediately.
+
+        Only this subscription's cursor is invalidated (the row is kept as
+        ``released`` so a stale instance id is always rejected).  No change
+        row, main version or snapshot held by anyone else is touched:
+        reclamation happens on the next ``collect_history``.
+        """
+        self._begin_write()
+        try:
+            row = self.writer.execute(
+                f"SELECT instance_id, start_gen, ack_gen, ack_seq "
+                f"FROM {SUBSCRIPTION_TABLE} WHERE name = ? AND status = 'active'",
+                (name,),
+            ).fetchone()
+            if row is None:
+                raise SubscriptionNotFoundError(
+                    f"no active change subscription named {name!r}"
+                )
+            iid, start_gen, ack_gen, ack_seq = row
+            if instance_id is not None and instance_id != iid:
+                raise SubscriptionConflictError(
+                    f"subscription name {name!r} now refers to a different "
+                    f"instance ({iid}); the supplied identity {instance_id} is "
+                    "stale"
+                )
+            self.writer.execute(
+                f"UPDATE {SUBSCRIPTION_TABLE} SET status = 'released' "
+                "WHERE instance_id = ?",
+                (iid,),
+            )
+            self._commit()
+        except BaseException:
+            self._rollback()
+            raise
+        return {
+            "released": name,
+            "instance_id": iid,
+            "start_gen": start_gen,
+            "ack": {"gen": ack_gen, "seq": ack_seq},
+        }
+
+    def _resolve_subscription_cursor(self, cursor_token: str,
+                                     info: SubscriptionInfo):
+        try:
+            cursor = decode_subscription_cursor(cursor_token, self.secret)
+        except TokenError as exc:
+            raise SubscriptionCursorError(str(exc)) from None
+        if cursor.collection_id != self.collection_id:
+            raise SubscriptionCursorError(
+                "cursor belongs to a different collection"
+            )
+        if cursor.db_path != self.path:
+            raise SubscriptionCursorError(
+                "cursor was created against a different file path"
+            )
+        if cursor.instance_id != info.instance_id:
+            raise SubscriptionCursorError(
+                "cursor belongs to a different subscription instance "
+                "(a deleted and re-created same-name subscription cannot "
+                "continue it)"
+            )
+        if cursor.name != info.name:
+            raise SubscriptionCursorError(
+                f"cursor belongs to subscription {cursor.name!r}, not "
+                f"{info.name!r}"
+            )
+        # The credential binds the acknowledged generation it was issued
+        # against.  The normal flow -- read a page, acknowledge exactly its
+        # end, continue with its cursor -- is allowed because the page start
+        # is still at or beyond the ack.  But if the acknowledged position has
+        # advanced past this page's start (another process consumed it, or the
+        # caller acknowledges a later page first), the credential is stale:
+        # reject it rather than silently replay already-applied events.
+        if (cursor.start_gen, cursor.start_seq) < (info.ack_gen, info.ack_seq):
+            raise SubscriptionConflictError(
+                f"cursor page (issued against ack ({cursor.ack_gen}, "
+                f"{cursor.ack_seq})) starts at ({cursor.start_gen}, "
+                f"{cursor.start_seq}), which is already acknowledged; the "
+                f"subscription is now at ({info.ack_gen}, {info.ack_seq}). "
+                "Re-read from the acknowledged position instead"
+            )
+        if (cursor.start_gen, cursor.start_seq) < (info.start_gen, 0):
+            raise SubscriptionCursorError(
+                "cursor start position precedes the subscription start"
+            )
+        if cursor.start_gen < 1:
+            raise SubscriptionCursorError(
+                "cursor position precedes the first publishable generation"
+            )
+        floor = self._change_floor()
+        if cursor.start_gen + 1 < floor:
+            raise SubscriptionCursorError(
+                f"cursor position ({cursor.start_gen}, {cursor.start_seq}) is "
+                f"below the retained change boundary {floor}; the events it "
+                "still needs have been reclaimed"
+            )
+        head = self._meta_int_reader("head")
+        if cursor.horizon < 1:
+            raise SubscriptionCursorError(
+                "cursor horizon is inconsistent with the subscription position"
+            )
+        if cursor.start_gen > head + 1:
+            raise SubscriptionCursorError(
+                "a cursor beyond the next generation is not a valid position"
+            )
+        if cursor.start_gen == head + 1 and cursor.start_seq != 0:
+            raise SubscriptionCursorError(
+                "a cursor beyond the current head cannot start mid-generation"
+            )
+        if cursor.start_gen <= head and cursor.start_seq > 0 \
+                and cursor.start_gen >= max(floor, 1):
+            count = self._event_count(cursor.start_gen)
+            if cursor.start_seq > count:
+                raise SubscriptionCursorError(
+                    f"cursor position ({cursor.start_gen}, "
+                    f"{cursor.start_seq}) is past the recorded end ({count}) "
+                    "of that generation; the page credential is invalid"
+                )
+        return cursor
+
+    def read_changes_page(
+        self,
+        name: str,
+        page_size: int,
+        *,
+        cursor_token: str | None = None,
+    ) -> ChangePage:
+        """Read one bounded page of change events from a subscription.
+
+        A **position** is ``(gen, seq)`` where ``seq`` is the last event
+        consumed in ``gen``; ``seq == 0`` means nothing has been consumed from
+        that generation yet.  Positions compare lexicographically, so
+        ``(g+1, 0)`` follows every event of ``g``.  This encoding makes empty
+        and all-no-op generations crossable: their marker moves the consumer
+        to ``(g+1, 0)`` without inventing an event.
+
+        The first page begins at the subscription's acknowledged position and
+        reads up to the current head.  Later pages use the credential returned
+        by the previous page, which pins the acknowledged position it was
+        issued against and the head horizon, so re-reading an unchanged
+        unacknowledged page is deterministic (same events, same successor
+        credential).  A page may stop inside one large generation; memory is
+        bounded by ``page_size`` plus a single probe row and every read is a
+        primary-key seek, never a walk from generation one.  Batch markers of
+        every generation entered -- including empty ones -- are reported.
+        """
+        if isinstance(page_size, bool) or not isinstance(page_size, int) \
+                or page_size <= 0:
+            raise SubscriptionError("page_size must be a positive integer")
+        info = self.subscription_info(name)
+        head = self._meta_int_reader("head")
+        if cursor_token is None:
+            ack_gen, ack_seq = info.ack_gen, info.ack_seq
+            pos_gen, pos_seq = info.ack_gen, info.ack_seq
+            horizon = head
+        else:
+            cursor = self._resolve_subscription_cursor(cursor_token, info)
+            ack_gen, ack_seq = cursor.ack_gen, cursor.ack_seq
+            pos_gen, pos_seq = cursor.start_gen, cursor.start_seq
+            horizon = cursor.horizon
+            if (pos_gen, pos_seq) == (horizon + 1, 0) and horizon < head:
+                # The credential came from a page that had fully drained the
+                # stream.  It doubles as a durable resume token: re-open the
+                # horizon so newly published generations are delivered instead
+                # of requiring the consumer to drop the cursor.
+                horizon = head
+        if pos_gen < 1:
+            # A brand-new collection has no generation 0 stream; the first
+            # publishable position is (1, 0).
+            pos_gen, pos_seq = 1, 0
+        floor = self._change_floor()
+        if pos_gen < floor:
+            # Reclamation keeps a generation alive for every active
+            # subscription whose acknowledgement still needs it, so a
+            # position one generation below the floor can only mean its
+            # events were already consumed; skip the reclaimed marker.  Any
+            # deeper gap means this consumer's events are genuinely gone.
+            if pos_gen + 1 >= floor:
+                pos_gen, pos_seq = floor, 0
+            else:
+                raise SubscriptionCursorError(
+                    f"subscription {name!r} is at generation {pos_gen} but "
+                    f"the retained change boundary is {floor}; its remaining "
+                    "events have been reclaimed"
+                )
+
+        width = len(self.schema.columns)
+        events: list[ChangeEvent] = []
+        markers: list[ChangeBatchMarker] = []
+        examined = 0
+        markers_read = 0
+        has_more = False
+        pos_g, pos_s = pos_gen, pos_seq
+        gen, seq_after = pos_gen, pos_seq
+        while gen <= horizon:
+            if len(events) >= page_size or len(markers) >= page_size:
+                break
+            marker = self._load_marker(gen, floor)
+            markers_read += 1
+            # Entering (or resuming inside) a generation crosses/records its
+            # batch boundary.  Empty and all-no-op generations are reported
+            # here even though they contribute no event.
+            markers.append(marker)
+            rows = self.reader.execute(
+                f"SELECT gen, seq, rid, kind, before_json, after_json "
+                f"FROM {CHANGE_TABLE} WHERE gen = ? AND seq > ? "
+                "ORDER BY seq LIMIT ?",
+                (gen, seq_after, page_size - len(events) + 1),
+            ).fetchall()
+            stopped_mid = False
+            for r in rows:
+                examined += 1
+                if len(events) >= page_size:
+                    stopped_mid = True
+                    break
+                ev_gen, ev_seq = r[0], r[1]
+                events.append(ChangeEvent(
+                    gen=ev_gen, seq=ev_seq, row_id=r[2], kind=r[3],
+                    before=decode_image(r[4], width, ev_gen, ev_seq),
+                    after=decode_image(r[5], width, ev_gen, ev_seq),
+                ))
+                pos_g, pos_s = ev_gen, ev_seq
+            if stopped_mid:
+                break
+            # The generation is fully crossed; the successor is just past it
+            # (so an empty generation still advances the consumer).
+            pos_g, pos_s = gen + 1, 0
+            gen += 1
+            seq_after = 0
+
+        # The stream is complete only at the canonical position just past the
+        # horizon.  Stopping exactly at the end of the last *eventful*
+        # generation still leaves later (possibly empty) generations to cross,
+        # so their markers are reported on the next page rather than silently
+        # skipped.
+        if not has_more:
+            has_more = (pos_g, pos_s) < (horizon + 1, 0)
+        if not has_more:
+            pos_g, pos_s = horizon + 1, 0
+
+        acked_skipped = self._acked_event_count(ack_gen, ack_seq)
+        next_cursor = encode_subscription_cursor(
+            secret=self.secret,
+            collection_id=self.collection_id,
+            instance_id=info.instance_id,
+            name=info.name,
+            ack_gen=ack_gen,
+            ack_seq=ack_seq,
+            start_gen=pos_g,
+            start_seq=pos_s,
+            horizon=horizon,
+            page_size=page_size,
+            db_path=self.path,
+        )
+        stats = ChangeReadStats(
+            start_gen=pos_gen, start_seq=pos_seq,
+            ack_gen=ack_gen, ack_seq=ack_seq,
+            next_gen=pos_g, next_seq=pos_s,
+            events_examined=examined, events_returned=len(events),
+            batch_markers_accessed=markers_read,
+            acked_skipped=acked_skipped,
+            has_more=has_more,
+        )
+        # Persist how far this subscription has actually been read; an
+        # acknowledgement may never move past this frontier.  The move is
+        # monotone and per-subscription, so readers never perturb each other.
+        self._advance_read_frontier(info.instance_id, pos_g, pos_s)
+        return ChangePage(
+            name=info.name,
+            instance_id=info.instance_id,
+            events=events,
+            batches=markers,
+            next_cursor=next_cursor,
+            gen=pos_g,
+            seq=pos_s,
+            ack_gen=ack_gen,
+            ack_seq=ack_seq,
+            has_more=has_more,
+            head=head,
+            stats=stats,
+            collection_id=self.collection_id,
+            row_id_name=self.row_id_name,
+        )
+
+    def _event_count(self, gen: int) -> int:
+        if gen < 1:
+            return 0
+        row = self.reader.execute(
+            f"SELECT event_count FROM {CHANGE_BATCH_TABLE} WHERE gen = ?",
+            (gen,),
+        ).fetchone()
+        return 0 if row is None else row[0]
+
+    def _acked_event_count(self, ack_gen: int, ack_seq: int) -> int:
+        """How many stored events sit at or below an acknowledged position."""
+        if ack_gen < 1:
+            return 0
+        row = self.reader.execute(
+            f"SELECT cum_events, event_count FROM {CHANGE_BATCH_TABLE} "
+            "WHERE gen = ?",
+            (ack_gen,),
+        ).fetchone()
+        if row is not None:
+            return max(0, row[0] - row[1] + ack_seq)
+        # Position past the newest retained generation: every stored event is
+        # acknowledged.
+        last = self.reader.execute(
+            f"SELECT cum_events FROM {CHANGE_BATCH_TABLE} "
+            "ORDER BY gen DESC LIMIT 1"
+        ).fetchone()
+        return 0 if last is None else last[0]
+
+    def _load_marker(self, gen: int, floor: int) -> ChangeBatchMarker:
+        row = self.reader.execute(
+            f"SELECT batch_id, digest, event_count, cum_events "
+            f"FROM {CHANGE_BATCH_TABLE} WHERE gen = ?",
+            (gen,),
+        ).fetchone()
+        if row is None:
+            if gen < floor:
+                raise SubscriptionCursorError(
+                    f"generation {gen} is below the retained change boundary "
+                    f"{floor} and its marker has been reclaimed"
+                )
+            raise ChangeLogError(
+                f"change stream is missing the batch marker for generation "
+                f"{gen}; the change log is corrupt or truncated"
+            )
+        return ChangeBatchMarker(gen=gen, batch_id=row[0], digest=row[1],
+                                 event_count=row[2], cum_events=row[3])
+
+    def _advance_read_frontier(self, instance_id: str, gen: int,
+                               seq: int) -> None:
+        """Persist how far this subscription has actually been read."""
+        self._begin_write()
+        try:
+            row = self.writer.execute(
+                f"SELECT read_gen, read_seq, status FROM {SUBSCRIPTION_TABLE} "
+                "WHERE instance_id = ?",
+                (instance_id,),
+            ).fetchone()
+            if row is None or row[2] != "active":
+                raise SubscriptionNotFoundError(
+                    "subscription instance was released while a page was "
+                    "being read"
+                )
+            if (gen, seq) > (row[0], row[1]):
+                self.writer.execute(
+                    f"UPDATE {SUBSCRIPTION_TABLE} SET read_gen = ?, read_seq = ? "
+                    "WHERE instance_id = ?",
+                    (gen, seq, instance_id),
+                )
+                self._commit()
+            else:
+                self._rollback()
+        except BaseException:
+            self._rollback()
+            raise
+
+    def acknowledge_changes(
+        self,
+        name: str,
+        *,
+        gen: int | None = None,
+        seq: int | None = None,
+        expected_gen: int,
+        expected_seq: int,
+        instance_id: str | None = None,
+        cursor_token: str | None = None,
+    ) -> dict:
+        """Advance the durable acknowledged position, with optimistic check.
+
+        The move must stay within the subscription's own *read* frontier
+        (never skipping unread events), may not go backwards, and must match
+        the caller's ``expected_*`` old position exactly.  Re-sending the very
+        acknowledgement whose response was lost is idempotent: when the target
+        already equals the stored position it reports success without moving
+        anything.  A concurrent advance makes the caller's expected position
+        stale and is rejected instead of being overwritten.
+        """
+        if cursor_token is not None:
+            # Acknowledging through a page credential: it must belong to *this*
+            # subscription instance, and it names the page end it was issued
+            # for.  A credential from another subscription (or from a deleted
+            # and re-created same-name instance) is rejected.
+            if gen is not None or seq is not None:
+                raise SubscriptionError(
+                    "give either an explicit position or a cursor, not both"
+                )
+            try:
+                cursor = decode_subscription_cursor(
+                    cursor_token, self.secret
+                )
+            except TokenError as exc:
+                raise SubscriptionCursorError(str(exc)) from None
+            if cursor.collection_id != self.collection_id \
+                    or cursor.db_path != self.path:
+                raise SubscriptionCursorError(
+                    "cursor belongs to a different collection or file"
+                )
+            gen, seq = cursor.start_gen, cursor.start_seq
+            if instance_id is None:
+                instance_id = cursor.instance_id
+        if gen is None or seq is None:
+            raise SubscriptionError(
+                "acknowledgement requires a position or a cursor"
+            )
+        for label, value in (
+            ("gen", gen), ("seq", seq),
+            ("expected_gen", expected_gen), ("expected_seq", expected_seq),
+        ):
+            if isinstance(value, bool) or not isinstance(value, int):
+                raise SubscriptionError(f"{label} must be an integer")
+        if gen < 1 or seq < 0:
+            raise SubscriptionError("acknowledged position is out of range")
+        self._begin_write()
+        try:
+            row = self.writer.execute(
+                f"SELECT instance_id, status, ack_gen, ack_seq, read_gen, "
+                f"read_seq FROM {SUBSCRIPTION_TABLE} WHERE name = ? "
+                "AND status = 'active'",
+                (name,),
+            ).fetchone()
+            if row is None:
+                raise SubscriptionNotFoundError(
+                    f"no active change subscription named {name!r}"
+                )
+            iid, _status, ack_gen, ack_seq, read_gen, read_seq = row
+            if instance_id is not None and instance_id != iid:
+                raise SubscriptionConflictError(
+                    f"subscription name {name!r} now refers to a different "
+                    f"instance ({iid}); the supplied identity {instance_id} is "
+                    "stale"
+                )
+            head = self._meta_int("head")
+            self._validate_position(gen, seq, head)
+            target = (gen, seq)
+            current = (ack_gen, ack_seq)
+            expected = (expected_gen, expected_seq)
+            if target == current:
+                # The requested end state already holds: a lost-response
+                # replay succeeds without moving anything.
+                self._rollback()
+                return self._ack_result(name, iid, ack_gen, ack_seq,
+                                        read_gen, read_seq, replayed=True)
+            if target < current:
+                raise SubscriptionConflictError(
+                    f"acknowledgement cannot move backwards from "
+                    f"({ack_gen}, {ack_seq}) to {target}"
+                )
+            if expected != current:
+                raise SubscriptionConflictError(
+                    f"acknowledgement conflict: expected old position "
+                    f"({expected_gen}, {expected_seq}) but the subscription is "
+                    f"at ({ack_gen}, {ack_seq}); a concurrent acknowledgement "
+                    "already advanced it"
+                )
+            frontier = (read_gen, read_seq)
+            if target > frontier:
+                raise SubscriptionSkippedError(
+                    f"acknowledgement {target} skips unread events; the "
+                    f"subscription has only read up to {frontier}"
+                )
+            self.writer.execute(
+                f"UPDATE {SUBSCRIPTION_TABLE} SET ack_gen = ?, ack_seq = ? "
+                "WHERE instance_id = ? AND status = 'active'",
+                (gen, seq, iid),
+            )
+            self._commit()
+        except BaseException:
+            self._rollback()
+            raise
+        return self._ack_result(name, iid, gen, seq, read_gen, read_seq,
+                                replayed=False)
+
+    def _validate_position(self, gen: int, seq: int, head: int) -> None:
+        """A position must name a real slot: ``seq <= event_count(gen)``."""
+        if gen > head + 1:
+            raise SubscriptionSkippedError(
+                f"position ({gen}, {seq}) is beyond the next publishable "
+                f"generation (current head {head})"
+            )
+        if gen == head + 1:
+            if seq != 0:
+                raise SubscriptionSkippedError(
+                    f"position ({gen}, {seq}) is past the current head {head}"
+                )
+            return
+        count = self._event_count(gen)
+        if seq > count:
+            raise SubscriptionSkippedError(
+                f"position ({gen}, {seq}) is past the end of generation "
+                f"{gen} ({count} events); it was never read"
+            )
+
+    @staticmethod
+    def _ack_result(name, iid, ack_gen, ack_seq, read_gen, read_seq, *,
+                    replayed: bool) -> dict:
+        return {
+            "name": name,
+            "instance_id": iid,
+            "ack": {"gen": ack_gen, "seq": ack_seq},
+            "ack_gen": ack_gen,
+            "ack_seq": ack_seq,
+            "read": {"gen": read_gen, "seq": read_seq},
+            "replayed": replayed,
+        }
+
+    def change_retention(self) -> dict:
+        """Report the retained change horizon and the reclaimable extent."""
+        head = self._meta_int_reader("head")
+        floor = min(self._change_floor(), head + 1)
+        events = self.reader.execute(
+            f"SELECT COUNT(*) FROM {CHANGE_TABLE}"
+        ).fetchone()[0]
+        batches = self.reader.execute(
+            f"SELECT COUNT(*) FROM {CHANGE_BATCH_TABLE}"
+        ).fetchone()[0]
+        oldest = self.reader.execute(
+            f"SELECT MIN(gen) FROM {CHANGE_BATCH_TABLE}"
+        ).fetchone()[0]
+        subs = self.list_subscriptions()
+        return {
+            "head": head,
+            # Earliest generation a *new* subscription may start from.
+            "retain_from": floor,
+            "newest_start_gen": head + 1,
+            "oldest_retained_gen": oldest,
+            "change_events_retained": events,
+            "change_batches_retained": batches,
+            "active_subscriptions": [s.to_dict() for s in subs],
+        }
+
     # -- history collection ------------------------------------------------
 
     def collect_history(self, retain_from: int) -> HistoryStats:
@@ -2268,6 +3164,15 @@ class Collection:
         active snapshot can still see is kept, regardless of age; entries with
         no possible reader at or above the new boundary are physically
         deleted.  Receipts and head are never removed.
+
+        Change-stream records obey a *separate* eligibility rule: a generation
+        (its events and its batch marker) is reclaimed only once every active
+        subscription has acknowledged past it.  A slow subscriber therefore
+        pins exactly the generations it still needs, while a generation that
+        all subscribers have consumed is removed regardless of how old the
+        main-version boundary is.  The new earliest start generation is
+        recorded, so a later subscription attempt below it fails with the
+        boundary instead of silently missing events.
         """
         if isinstance(retain_from, bool) or not isinstance(retain_from, int):
             raise HistoryError("retain_from must be an integer generation")
@@ -2340,9 +3245,63 @@ class Collection:
                 "  AND i.status = 'building')"
             ).rowcount
             self._set_meta("retain_from", retain_from)
+
+            # ---- change-stream reclamation, independent of the boundary ----
+            previous_change_floor = int(
+                self.writer.execute(
+                    f"SELECT value FROM {META_TABLE} "
+                    "WHERE name = 'change_retain_from'"
+                ).fetchone()[0]
+            )
+            subs = self.writer.execute(
+                f"SELECT ack_gen, ack_seq FROM {SUBSCRIPTION_TABLE} "
+                "WHERE status = 'active'"
+            ).fetchall()
+            if subs:
+                needed_from = head + 1
+                for ack_gen, ack_seq in subs:
+                    count = self.writer.execute(
+                        f"SELECT event_count FROM {CHANGE_BATCH_TABLE} "
+                        "WHERE gen = ?",
+                        (ack_gen,),
+                    ).fetchone()
+                    event_count = 0 if count is None else count[0]
+                    # Position (g, s): s events of generation g are consumed.
+                    # A generation is no longer needed once the consumer is at
+                    # (g+1, 0) -- its canonical successor -- because every
+                    # event and the marker itself were part of page(s) it has
+                    # acknowledged.
+                    if ack_gen >= 1 and ack_seq == 0:
+                        first_needed = ack_gen
+                    elif ack_seq >= event_count:
+                        first_needed = ack_gen + 1
+                    else:
+                        first_needed = max(ack_gen, 1)
+                    needed_from = min(needed_from, first_needed)
+            else:
+                # Nobody is reading: all retained history is reclaimable and
+                # new subscriptions start from the next publish.
+                needed_from = head + 1
+            new_change_floor = max(previous_change_floor, needed_from)
+            new_change_floor = min(new_change_floor, head + 1)
+            change_events_removed = 0
+            change_batches_removed = 0
+            if new_change_floor > previous_change_floor:
+                change_events_removed = self.writer.execute(
+                    f"DELETE FROM {CHANGE_TABLE} WHERE gen < ?",
+                    (new_change_floor,),
+                ).rowcount
+                change_batches_removed = self.writer.execute(
+                    f"DELETE FROM {CHANGE_BATCH_TABLE} WHERE gen < ?",
+                    (new_change_floor,),
+                ).rowcount
+            if new_change_floor != previous_change_floor:
+                self._set_meta("change_retain_from", new_change_floor)
+
             active = self.writer.execute(
                 f"SELECT COUNT(*) FROM {SNAPSHOT_TABLE} WHERE status = 'active'"
             ).fetchone()[0]
+            active_subs = len(subs)
             self._commit()
         except BaseException:
             self._rollback()
@@ -2355,6 +3314,11 @@ class Collection:
             head=head,
             secondary_entries_removed=sec_removed,
             queue_entries_removed=queue_removed,
+            change_events_removed=change_events_removed,
+            change_batches_removed=change_batches_removed,
+            change_retain_from=new_change_floor,
+            previous_change_retain_from=previous_change_floor,
+            active_subscriptions=active_subs,
         )
 
     # -- status ------------------------------------------------------------
@@ -2392,6 +3356,23 @@ class Collection:
             }
             for i in self.list_indexes(include_deleted=False)
         ]
+        change_floor = min(self._change_floor(), head + 1)
+        change_batches = self.reader.execute(
+            f"SELECT COUNT(*) FROM {CHANGE_BATCH_TABLE}"
+        ).fetchone()[0]
+        change_events = self.reader.execute(
+            f"SELECT COUNT(*) FROM {CHANGE_TABLE}"
+        ).fetchone()[0]
+        subscriptions = [
+            {
+                "name": s.name,
+                "instance_id": s.instance_id,
+                "start_gen": s.start_gen,
+                "ack": {"gen": s.ack_gen, "seq": s.ack_seq},
+                "read": {"gen": s.read_gen, "seq": s.read_seq},
+            }
+            for s in self.list_subscriptions()
+        ]
         return CollectionStatus(
             path=self.path,
             collection_id=self.collection_id,
@@ -2405,6 +3386,10 @@ class Collection:
             receipt_count=receipts,
             active_snapshots=active,
             indexes=indexes,
+            change_retain_from=change_floor,
+            change_head_count=change_batches,
+            change_event_count=change_events,
+            subscriptions=subscriptions,
         )
 
     def _meta_int_reader(self, name: str) -> int:

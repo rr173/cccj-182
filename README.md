@@ -349,6 +349,206 @@ python3 -I tests/test_collection_cli.py        # full CLI lifecycle and failure 
 
 ---
 
+# Persistent change subscriptions (downstream change feed)
+
+A downstream warehouse no longer has to re-scan the current snapshot.  Each
+successful `apply` publishes one generation *and* appends a durable,
+totally-ordered change record for it; any number of independent named
+**subscriptions** read those records in pages, persist their acknowledged
+position, and survive process exit.  This layer is additive: snapshot
+queries, secondary indexes, receipts and joins are unchanged.
+
+## Storage model (and why an outbox)
+
+Three tables are written by the **same `BEGIN IMMEDIATE` transaction** as the
+main version rows, `head` and the idempotency receipt:
+
+```
+bytekey_changes(gen, seq, rid, kind, before_json, after_json,
+                PRIMARY KEY(gen, seq)) WITHOUT ROWID
+bytekey_change_batches(gen PRIMARY KEY, batch_id, digest,
+                       event_count, cum_events) WITHOUT ROWID
+bytekey_subscriptions(instance_id PRIMARY KEY, name, status, start_gen,
+                      ack_gen, ack_seq, read_gen, read_seq, created_seq)
+```
+
+`bytekey_changes` is an **outbox**: one row per *state-changing* operation
+(insert / update / delete) carrying the *complete* before and after business
+tuples as canonical type-tagged JSON.  `bytekey_change_batches` has one row
+per successful generation -- including empty and all-no-op batches -- with
+its event count, so every publish has a position a consumer can cross.
+
+This representation was chosen over reconstructing per-generation before/after
+images from the version table's `(cgen, dgen)` because it makes the required
+semantics exact and cheap:
+
+* the before image is captured while the superseded version is still known,
+  so a later history collection of main versions can never silently destroy a
+  subscriber's required old value;
+* an empty / all-no-op generation still has a durable position (its batch
+  marker), so consumers cross it without inventing an event;
+* the outbox is invisible until commit and rolls back with the batch: failed
+  validation leaves no change record, and a lost reply re-sends the stored
+  receipt without appending a second generation or duplicate events;
+* a page is a primary-key seek on `(gen, seq)` -- bounded memory and bounded
+  I/O, never a scan from generation one -- and memories of *before* images
+  stay O(events), not one full copy per generation.
+
+`seq` is assigned in the deterministic, replayable processing order (row_id
+ascending), so re-reading an unchanged page reproduces the same events and the
+same successor credential.
+
+## Positions, pages and acknowledgement
+
+A **position** is `(gen, seq)`: `seq` is the last event consumed in `gen`, and
+`seq == 0` means nothing of that generation has been consumed.  Positions
+compare lexicographically, so `(g+1, 0)` follows every event of `g`; this is
+how empty generations advance a consumer.  A subscription stores an
+acknowledged position and a read frontier (how far it has actually paged);
+acknowledgement may only advance within the read frontier, may not go
+backwards, and must match the caller's expected old position.  Re-sending the
+acknowledgement whose response was lost is idempotent.
+
+The page credential (HMAC-signed `scur` token) binds the collection identity
+and path, the immutable subscription **instance id**, the subscription name,
+the acknowledged position the page was issued against, the exclusive page
+start, the head horizon and the page size.  Consequences:
+
+* a deleted and re-created same-name subscription cannot continue an old
+  cursor (new instance id);
+* a cursor from another subscription, collection or file is refused;
+* a page whose position is already acknowledged (another process advanced, or
+  a later page was acknowledged first) is stale and refused, not silently
+  replayed;
+* re-reading an unacknowledged page is deterministic; a page may end inside a
+  large generation, and the successor credential continues exactly at the
+  next `seq`.
+
+## Retention
+
+Change records and batch markers obey their **own** eligibility rule, separate
+from the main-version / snapshot boundary: a generation is reclaimed only when
+every active subscription has acknowledged past it, so a slow subscriber pins
+exactly the generations (and before-images) it still needs.  Releasing a
+subscription invalidates its cursors immediately but touches no other
+subscriber's events, no snapshot and no live row; the *next*
+`collect_history` removes what only it was holding.  `collect_history` reports
+`change_events_removed` and `change_batches_removed` separately from
+`main_entries_removed`, plus `change_retain_from` -- the earliest generation a
+new subscription may start from.  Subscribing or paging below it fails with a
+message naming the boundary.
+
+## API
+
+```python
+from bytekey import open_collection
+
+coll = open_collection("warehouse.db")
+sub  = coll.begin_subscription("reporting", start_gen=1)   # or from_head=True
+page = coll.read_changes_page("reporting", page_size=500)
+for ev in page.events:                 # ChangeEvent
+    ev.gen, ev.seq, ev.row_id          # position and identity
+    ev.kind                            # "insert" | "update" | "delete"
+    ev.before, ev.after                # complete tuple, or None == absent
+for batch in page.batches:             # one marker per generation entered
+    batch.gen, batch.batch_id, batch.event_count
+coll.acknowledge_changes(
+    "reporting",
+    gen=page.gen, seq=page.seq,        # new acknowledged position
+    expected_gen=sub.ack_gen, expected_seq=sub.ack_seq,  # compare-and-set
+)
+# continue (in this or another process) with page.next_cursor
+
+coll.collect_history(coll.status().head)   # safe: pins unacked generations
+coll.change_retention()                    # earliest start gen + live subs
+coll.release_subscription("reporting")
+```
+
+`ev.before` / `ev.after` are `None` for the absent side; an all-null business
+row is a *present* tuple of nulls and never confused with absence (see
+`ChangeEvent.to_dict`, which renders `{"present": false}` vs
+`{"present": true, "values": [...]}`).
+
+## Commands
+
+`subscription-read` prints exactly one page per invocation, so a consumer can
+save the cursor and exit.  `bytes` values use `{"__hex__": "..."}`.
+
+```bash
+python bytekey_cli.py subscription-create --collection warehouse.db \
+    --name reporting --start-gen 1            # or --from-head
+python bytekey_cli.py subscription-list     --collection warehouse.db [--name reporting]
+python bytekey_cli.py subscription-read     --collection warehouse.db \
+    --name reporting --page-size 500 [--cursor "$CUR"]
+python bytekey_cli.py subscription-ack      --collection warehouse.db \
+    --name reporting --gen 3 --seq 2 --expected-gen 1 --expected-seq 0
+# ... or acknowledge the page end named by a credential directly:
+python bytekey_cli.py subscription-ack      --collection warehouse.db \
+    --name reporting --cursor "$CUR" --expected-gen 1 --expected-seq 0
+python bytekey_cli.py subscription-release  --collection warehouse.db --name reporting
+python bytekey_cli.py change-retention      --collection warehouse.db
+```
+
+## End-to-end walk-through (apply → read → ack → restart → reclaim)
+
+```bash
+python bytekey_cli.py collection-create --schema schema.json --collection wh.db
+# gen 1
+python bytekey_cli.py apply --collection wh.db --batch-id b1.json \
+    --expected-head 0 --source ops1.jsonl
+# gen 2 (an empty batch still has a position)
+python bytekey_cli.py apply --collection wh.db --batch-id b2.json \
+    --expected-head 1 --source empty.jsonl
+python bytekey_cli.py subscription-create --collection wh.db --name export --start-gen 1
+
+# read one page (page size 1 here), save the cursor and the position
+python bytekey_cli.py subscription-read --collection wh.db \
+    --name export --page-size 1 > p1.json
+CUR=$(python3 -c "import json;print(json.load(open('p1.json'))['next_cursor'])")
+GEN=$(python3 -c "import json;print(json.load(open('p1.json'))['gen'])")
+SEQ=$(python3 -c "import json;print(json.load(open('p1.json'))['seq'])")
+# acknowledge exactly that page end (old position = subscription start)
+python bytekey_cli.py subscription-ack --collection wh.db \
+    --name export --gen "$GEN" --seq "$SEQ" --expected-gen 1 --expected-seq 0
+
+# ... process exits.  A new process continues from the saved cursor:
+python bytekey_cli.py subscription-read --collection wh.db \
+    --name export --page-size 1 --cursor "$CUR" > p2.json
+
+# once fully acknowledged, collection reclaims the change rows safely
+python bytekey_cli.py collect-history --collection wh.db --retain-from 2
+python bytekey_cli.py change-retention --collection wh.db
+```
+
+## Upgrading an existing collection
+
+An existing `bytekey-collection/v1` or `v2` file upgrades in place on open:
+identity, head, receipts, version rows and snapshot tokens are preserved and
+the change tables are added empty.  Because the original batches were never
+recorded, the upgrade stores a zero-event **boundary marker** at the upgrade
+head and sets the start boundary there: `begin_subscription(start_gen=head)`
+is allowed and crosses the boundary with no fabricated events, earlier
+generations are refused, and every later publish streams normally.  The
+upgrade is idempotent, so an interrupted migration completes on the next open
+and never leaves a subscription that looks enabled but lacks history.
+
+## Change-stream tests
+
+`tests/refchanges.py` derives every generation's event list from plain
+`dict` diffs and its own paging arithmetic; it imports neither the production
+storage nor the token code.
+
+```bash
+python3 -I tests/test_changes_fixture.py    # hand-computed fixture, per-page values
+python3 -I tests/test_changes_retention.py  # reclaim counts, boundaries, crash safety
+python3 -I tests/test_changes_random.py     # randomized differential vs dict model
+python3 -I tests/test_changes_large.py      # bounded pages, no ack replay, exact reclaim
+python3 -I tests/test_changes_cli.py        # cross-process CLI lifecycle and failures
+python3 -I demo/demo_changes.py             # runnable fixture: pages, ack, reclaim
+```
+
+---
+
 # Named secondary access indexes
 
 A collection's primary ordering is fixed by its schema. When a second workload
