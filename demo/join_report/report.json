@@ -1,0 +1,516 @@
+{
+  "scenarios": {
+    "mandated_full_default": {
+      "pages": 8,
+      "rows": [
+        [
+          "left_only",
+          {
+            "row_id": "l4",
+            "values": [
+              null,
+              "z",
+              9
+            ]
+          },
+          null
+        ],
+        [
+          "matched",
+          {
+            "row_id": "l1",
+            "values": [
+              "a",
+              "x",
+              2
+            ]
+          },
+          {
+            "row_id": "r2",
+            "values": [
+              "x",
+              "a",
+              "new"
+            ]
+          }
+        ],
+        [
+          "matched",
+          {
+            "row_id": "l1",
+            "values": [
+              "a",
+              "x",
+              2
+            ]
+          },
+          {
+            "row_id": "r1",
+            "values": [
+              "x",
+              "a",
+              "old"
+            ]
+          }
+        ],
+        [
+          "matched",
+          {
+            "row_id": "l2",
+            "values": [
+              "a",
+              "x",
+              3
+            ]
+          },
+          {
+            "row_id": "r2",
+            "values": [
+              "x",
+              "a",
+              "new"
+            ]
+          }
+        ],
+        [
+          "matched",
+          {
+            "row_id": "l2",
+            "values": [
+              "a",
+              "x",
+              3
+            ]
+          },
+          {
+            "row_id": "r1",
+            "values": [
+              "x",
+              "a",
+              "old"
+            ]
+          }
+        ],
+        [
+          "left_only",
+          {
+            "row_id": "l3",
+            "values": [
+              "b",
+              "y",
+              1
+            ]
+          },
+          null
+        ],
+        [
+          "right_only",
+          null,
+          {
+            "row_id": "r4",
+            "values": [
+              "z",
+              null,
+              "nil"
+            ]
+          }
+        ],
+        [
+          "right_only",
+          null,
+          {
+            "row_id": "r3",
+            "values": [
+              "q",
+              "c",
+              "only"
+            ]
+          }
+        ]
+      ],
+      "prepare_stats": {
+        "left": {
+          "access": "main",
+          "gen": 1,
+          "sid": "25afa4e221f5faf96afcc3d1ed976503",
+          "candidates_examined": 4,
+          "invisible_versions_skipped": 0,
+          "full_row_lookups": 0,
+          "rows_written": 4,
+          "intervals": [
+            {
+              "lower_hex": null,
+              "upper_hex": null
+            }
+          ],
+          "explain_query_plan": [
+            {
+              "id": 4,
+              "parent": 0,
+              "notused": 0,
+              "detail": "SCAN bytekey_kv"
+            }
+          ]
+        },
+        "right": {
+          "access": "main",
+          "gen": 1,
+          "sid": "64b97ac8f6e5ef670ef1373aa83a2449",
+          "candidates_examined": 4,
+          "invisible_versions_skipped": 0,
+          "full_row_lookups": 0,
+          "rows_written": 4,
+          "intervals": [
+            {
+              "lower_hex": null,
+              "upper_hex": null
+            }
+          ],
+          "explain_query_plan": [
+            {
+              "id": 4,
+              "parent": 0,
+              "notused": 0,
+              "detail": "SCAN bytekey_kv"
+            }
+          ]
+        },
+        "groups": {
+          "max_left_group": 2,
+          "left_duplicate_groups": 1,
+          "max_right_group": 2,
+          "right_duplicate_groups": 1,
+          "groups_disk_resident": true
+        },
+        "matched_right_rows": 2,
+        "source_checks": {
+          "left": {
+            "collection": "/workspace/demo/join_report/left.db",
+            "collection_id": "55609eabee407c7310c58387453d96cb",
+            "sid": "25afa4e221f5faf96afcc3d1ed976503",
+            "gen": 1,
+            "access": "main",
+            "ok": true
+          },
+          "right": {
+            "collection": "/workspace/demo/join_report/right.db",
+            "collection_id": "7734efb8524f63c02b6f2d316fe8b7f8",
+            "sid": "64b97ac8f6e5ef670ef1373aa83a2449",
+            "gen": 1,
+            "access": "main",
+            "ok": true
+          }
+        },
+        "work_file_bytes": 36864
+      }
+    },
+    "pinned_stream_survives_corrections": {
+      "history": {
+        "left": {
+          "retain_from": 3,
+          "previous_retain_from": 0,
+          "entries_removed": 0,
+          "main_entries_removed": 0,
+          "secondary_entries_removed": 0,
+          "queue_entries_removed": 0,
+          "active_snapshots": 1,
+          "head": 3
+        },
+        "right": {
+          "retain_from": 2,
+          "previous_retain_from": 0,
+          "entries_removed": 0,
+          "main_entries_removed": 0,
+          "secondary_entries_removed": 0,
+          "queue_entries_removed": 0,
+          "active_snapshots": 1,
+          "head": 2
+        }
+      },
+      "stream_unchanged": true
+    },
+    "token_release": {
+      "refused": true,
+      "error": "left source: snapshot token has been released"
+    },
+    "indexed_filtered_join": {
+      "pages": 4,
+      "rows": [
+        [
+          "left_only",
+          {
+            "row_id": "l3",
+            "values": [
+              "b",
+              "y",
+              1,
+              "v0-l3"
+            ]
+          },
+          null
+        ],
+        [
+          "matched",
+          {
+            "row_id": "l1",
+            "values": [
+              "a",
+              "x",
+              2,
+              "v0-l1"
+            ]
+          },
+          {
+            "row_id": "r1",
+            "values": [
+              "x",
+              "a",
+              "keep",
+              true
+            ]
+          }
+        ],
+        [
+          "matched",
+          {
+            "row_id": "l2",
+            "values": [
+              "a",
+              "x",
+              3,
+              "v0-l2"
+            ]
+          },
+          {
+            "row_id": "r1",
+            "values": [
+              "x",
+              "a",
+              "keep",
+              true
+            ]
+          }
+        ],
+        [
+          "right_only",
+          null,
+          {
+            "row_id": "r3",
+            "values": [
+              "q",
+              "c",
+              "keep",
+              true
+            ]
+          }
+        ]
+      ],
+      "prepare_stats": {
+        "left": {
+          "access": "index:qty_region",
+          "gen": 1,
+          "sid": "f510da1d867e3f6f43266182f75c8127",
+          "candidates_examined": 4,
+          "invisible_versions_skipped": 1,
+          "full_row_lookups": 3,
+          "rows_written": 3,
+          "intervals": [
+            {
+              "lower_hex": "048000000000000001",
+              "upper_hex": "048000000000000006"
+            }
+          ],
+          "explain_query_plan": [
+            {
+              "id": 3,
+              "parent": 0,
+              "notused": 0,
+              "detail": "SEARCH bytekey_sec_entries USING PRIMARY KEY (instance_id=? AND index_key>? AND index_key<?)"
+            }
+          ]
+        },
+        "right": {
+          "access": "index:label_product",
+          "gen": 1,
+          "sid": "51292d1fb28760668105a602e68d6976",
+          "candidates_examined": 3,
+          "invisible_versions_skipped": 1,
+          "full_row_lookups": 2,
+          "rows_written": 2,
+          "intervals": [
+            {
+              "lower_hex": "fa949a9a8fffff02",
+              "upper_hex": "fa949a9a8fffff07"
+            }
+          ],
+          "explain_query_plan": [
+            {
+              "id": 3,
+              "parent": 0,
+              "notused": 0,
+              "detail": "SEARCH bytekey_sec_entries USING PRIMARY KEY (instance_id=? AND index_key>? AND index_key<?)"
+            }
+          ]
+        },
+        "groups": {
+          "max_left_group": 2,
+          "left_duplicate_groups": 1,
+          "max_right_group": 1,
+          "right_duplicate_groups": 0,
+          "groups_disk_resident": true
+        },
+        "matched_right_rows": 1,
+        "source_checks": {
+          "left": {
+            "collection": "/workspace/demo/join_report/left2.db",
+            "collection_id": "3707892e664184b602ae4a7e6ea4a1aa",
+            "sid": "f510da1d867e3f6f43266182f75c8127",
+            "gen": 1,
+            "access": "index:qty_region",
+            "ok": true,
+            "instance_id": "391dcec9609be796ec14f49843a4d37a"
+          },
+          "right": {
+            "collection": "/workspace/demo/join_report/right2.db",
+            "collection_id": "72e68d65eb4075b58c33b84d1d469e44",
+            "sid": "51292d1fb28760668105a602e68d6976",
+            "gen": 1,
+            "access": "index:label_product",
+            "ok": true,
+            "instance_id": "4f5e93f220475f8b21d161f8bddd85bc"
+          }
+        },
+        "work_file_bytes": 36864
+      }
+    },
+    "large_duplicate_group": {
+      "left_rows": 340,
+      "right_rows": 61,
+      "hot_pairs": 2400,
+      "prepare_stats": {
+        "left": {
+          "access": "main",
+          "gen": 1,
+          "sid": "1dcf3e38e5b9bdcef0fc47f12b0135ad",
+          "candidates_examined": 340,
+          "invisible_versions_skipped": 0,
+          "full_row_lookups": 0,
+          "rows_written": 340,
+          "intervals": [
+            {
+              "lower_hex": null,
+              "upper_hex": null
+            }
+          ],
+          "explain_query_plan": [
+            {
+              "id": 4,
+              "parent": 0,
+              "notused": 0,
+              "detail": "SCAN bytekey_kv"
+            }
+          ]
+        },
+        "right": {
+          "access": "main",
+          "gen": 1,
+          "sid": "879c4a816f35a929d6cddf6ad703062b",
+          "candidates_examined": 61,
+          "invisible_versions_skipped": 0,
+          "full_row_lookups": 0,
+          "rows_written": 61,
+          "intervals": [
+            {
+              "lower_hex": null,
+              "upper_hex": null
+            }
+          ],
+          "explain_query_plan": [
+            {
+              "id": 4,
+              "parent": 0,
+              "notused": 0,
+              "detail": "SCAN bytekey_kv"
+            }
+          ]
+        },
+        "groups": {
+          "max_left_group": 40,
+          "left_duplicate_groups": 1,
+          "max_right_group": 60,
+          "right_duplicate_groups": 1,
+          "groups_disk_resident": true
+        },
+        "matched_right_rows": null,
+        "source_checks": {
+          "left": {
+            "collection": "/workspace/demo/join_report/groups-l.db",
+            "collection_id": "8bb0281d7d37318a37dc5e13a7659a2e",
+            "sid": "1dcf3e38e5b9bdcef0fc47f12b0135ad",
+            "gen": 1,
+            "access": "main",
+            "ok": true
+          },
+          "right": {
+            "collection": "/workspace/demo/join_report/groups-r.db",
+            "collection_id": "5b46b82dcbed7245cfc703973bf8c9c7",
+            "sid": "879c4a816f35a929d6cddf6ad703062b",
+            "gen": 1,
+            "access": "main",
+            "ok": true
+          }
+        },
+        "work_file_bytes": 65536
+      },
+      "segment_evidence": [
+        {
+          "page_index": 1200,
+          "left_rows_examined": 2,
+          "right_candidates_examined": 2,
+          "full_row_reads": 2,
+          "eqp_probe": [
+            "SEARCH bytekey_join_right USING INDEX bytekey_join_right_jkey (jkey=? AND rseq>?)"
+          ]
+        },
+        {
+          "page_index": 1201,
+          "left_rows_examined": 2,
+          "right_candidates_examined": 2,
+          "full_row_reads": 2,
+          "eqp_probe": [
+            "SEARCH bytekey_join_right USING INDEX bytekey_join_right_jkey (jkey=? AND rseq>?)"
+          ]
+        },
+        {
+          "page_index": 1202,
+          "left_rows_examined": 1,
+          "right_candidates_examined": 2,
+          "full_row_reads": 2,
+          "eqp_probe": [
+            "SEARCH bytekey_join_right USING INDEX bytekey_join_right_jkey (jkey=? AND rseq>?)"
+          ]
+        },
+        {
+          "page_index": 1203,
+          "left_rows_examined": 1,
+          "right_candidates_examined": 2,
+          "full_row_reads": 2,
+          "eqp_probe": [
+            "SEARCH bytekey_join_right USING INDEX bytekey_join_right_jkey (jkey=? AND rseq>?)"
+          ]
+        },
+        {
+          "page_index": 1204,
+          "left_rows_examined": 1,
+          "right_candidates_examined": 2,
+          "full_row_reads": 2,
+          "eqp_probe": [
+            "SEARCH bytekey_join_right USING INDEX bytekey_join_right_jkey (jkey=? AND rseq>?)"
+          ]
+        }
+      ],
+      "consumed_pairs": 1600
+    }
+  },
+  "note": "All database files are runtime fixtures and are removed after the run; only this bounded JSON report remains."
+}

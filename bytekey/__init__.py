@@ -12,6 +12,10 @@ Public API:
     TokenError, CollectionError, BatchError, ConflictError, HistoryError
     SecondaryDeclaration, IndexColumn, IndexPage, IndexScanStats,
     IndexBuildStatus, IndexInfo, CoverageError, IndexCursorError
+    JoinSource, Join, JoinPage, JoinRow, JoinSide, JoinPageStats,
+    prepare_join, open_join, terminate_join, join_status, join_cleanup,
+    JoinError, JoinDeclarationError, JoinStateError, JoinSourceError,
+    JoinCredentialError
 """
 from .schema import Schema, Column
 from .encoding import (
@@ -90,6 +94,27 @@ from .collection import (
     open_collection,
     import_from_index,
 )
+from .join import (
+    FULL,
+    INNER,
+    LEFT,
+    Join,
+    JoinCredentialError,
+    JoinDeclarationError,
+    JoinError,
+    JoinPage,
+    JoinPageStats,
+    JoinRow,
+    JoinSide,
+    JoinSource,
+    JoinSourceError,
+    JoinStateError,
+    join_cleanup,
+    join_status,
+    open_join,
+    prepare_join,
+    terminate_join,
+)
 
 __all__ = [
     "Schema",
@@ -162,4 +187,24 @@ __all__ = [
     "index_columns",
     "encode_index_key",
     "plan_index_query",
+    # Disk-backed two-source equi-join
+    "JoinSource",
+    "Join",
+    "JoinPage",
+    "JoinRow",
+    "JoinSide",
+    "JoinPageStats",
+    "prepare_join",
+    "open_join",
+    "terminate_join",
+    "join_status",
+    "join_cleanup",
+    "JoinError",
+    "JoinDeclarationError",
+    "JoinStateError",
+    "JoinSourceError",
+    "JoinCredentialError",
+    "INNER",
+    "LEFT",
+    "FULL",
 ]

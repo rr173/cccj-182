@@ -579,4 +579,222 @@ The randomized suite covers `None`, empty strings, and zero/NUL/0xFF bytes in
 the indexed and non-indexed columns, with every ready index drained against
 the independent, encoder-free reference model for every generation.
 
+---
+
+# Disk-backed two-source equi-join
+
+Two collections (or one collection joined with itself) can be **joined on
+equal business values** without loading either side into memory.  Each side
+is pinned by an existing snapshot token, reads through its primary ordering
+or one ready secondary index, and is filtered by an ordinary bytekey range
+query first; the join then pairs rows whose *mapped* columns are equal and
+streams the result page by page from a caller-specified **work file**.  The
+two schemas, column counts, orderings and index column orders may differ
+arbitrarily, and the join columns do not have to be a prefix of either
+access path.  SQLite is the only store; no external database or service.
+
+## Declaring a join read
+
+```python
+from bytekey import JoinSource, prepare_join, open_join
+
+result = prepare_join(
+    "join-work.db",                       # caller-specified work file
+    left=JoinSource("warehouse.db", token_l, query_l),                # main order
+    right=JoinSource("catalog.db", token_r, query_r, index="by_sku"), # or an index
+    mapping=[("region", "area"), ("sku", "product")],   # ordered column pairs
+    mode="full",                          # "inner" | "left" | "full"
+    nulls_equal=False,                    # default: null never equals
+    page_size=100,                        # fixed for this join read
+)
+handle = result["handle_token"]           # durable credential for this read
+```
+
+* **Column mapping** is a non-empty ordered list of column pairs
+  (left `[region, sku]` ↔ right `[area, product]`).  Each side's columns
+  must exist in its own schema without repeats, and corresponding columns
+  must have the **same kind** (`text`/`bytes`/`int64`/`bool` stay strictly
+  distinct; no string conversion, no Unicode normalization).
+* The two snapshot tokens need not come from the same clock moment; each
+  pins its own generation.  The join **never releases** the caller's tokens.
+* `prepare_join` verifies both sources, streams each filtered input out of
+  its pinned generation **once** (bounded, chunked), and writes only the two
+  inputs into the work file -- never the pairing result.  It refuses to
+  overwrite any existing file (a completed join, an unfinished prepare, or
+  a foreign file).
+
+## How equality is decided (no storage-key comparison)
+
+Equality is computed on **raw business values**, never on the two sides'
+storage keys (which embed direction inversion and the row_id tie-break and
+would be meaningless to compare across different orderings).  For every
+filtered row, prepare builds a neutral **join key**: the concatenation of
+the mapped columns' ordinary type-tagged encoding components (ascending,
+nulls-first).  The tag bytes keep `NULL`, empty text and empty bytes in
+separate domains, so they can never be grouped together; text is strict
+UTF-8 with no normalization.  Two rows join exactly when their join keys
+are byte-equal, i.e. when every mapped component is equal as a typed value.
+
+With the default null rule, a row whose mapped key contains `NULL` matches
+nothing (it becomes `left_only`/`right_only` in outer modes).  With
+`nulls_equal=True`, `NULL` components equal each other.  In both cases the
+join key is a *derived* value stored next to the copied row -- the sources
+are never modified.
+
+## How equal groups form and are enumerated on disk
+
+Inside the work file:
+
+```
+bytekey_join_left(lseq INTEGER PRIMARY KEY, jkey BLOB, has_null INT, payload BLOB)
+bytekey_join_right(rseq INTEGER PRIMARY KEY, jkey BLOB, has_null INT,
+                   matched INT, payload BLOB)
+INDEX bytekey_join_right_jkey(jkey, rseq)
+INDEX bytekey_join_right_unmatched(matched, rseq)
+```
+
+* `lseq`/`rseq` number the copied rows in their **source path order**;
+  `payload` is the row's full encoded main key, so delivery yields the
+  complete business tuple in schema order plus the original row_id --
+  non-join fields are never dropped.
+* Because the `(jkey, rseq)` index clusters every equal-key group into one
+  contiguous, positionally seekable run, a group of any size is a disk
+  range, not a memory buffer.  A left row's matches are produced by
+  `WHERE jkey = ? AND rseq > ? ORDER BY rseq` -- a B-tree **seek into the
+  middle of the group**, so resuming a page inside a giant duplicate group
+  never re-reads the group's head, and the whole right side is never
+  rescanned per left row.
+* For `full` mode, `matched` is precomputed once at prepare with a single
+  set operation over the two stored inputs (one bit per right row, honouring
+  the same null rule) -- that is how `right_only` rows are later found with
+  a `matched = 0 AND rseq > ?` seek.  The pairing result itself is never
+  stored: a 40x60 duplicate group is 100 stored rows and 2,400 streamed
+  pairs.
+
+Memory stays bounded by one page plus a one-row look-ahead regardless of
+input size, duplicate-group size, or the pairing product; a group larger
+than RAM and a product larger than both inputs simply stream.
+
+## Result order and paging
+
+Results follow the **left side's path order**: for each left row, all of
+its matches arrive in the **right side's path order**; an unmatched left
+row is delivered in place (`left_only`, left/full modes); `full` mode then
+appends the unmatched right rows (`right_only`) in right path order.  Every
+result row is explicitly `matched`, `left_only` or `right_only`; the absent
+side is a distinct `None`/JSON `null` marker, never a fabricated all-null
+row.  Direction, null placement and row_id tie-breaks of the result order
+come from the two source paths -- not from the join key.
+
+```python
+join = open_join("join-work.db", handle)     # any process, any time
+page, stats = join.page()                    # first page
+page, stats = join.page(page.next_cursor)    # next page; None ends the stream
+for row in page.rows:
+    row.kind                                 # "matched" | "left_only" | "right_only"
+    row.left  # JoinSide(row_id, values) or None
+    row.right # JoinSide(row_id, values) or None
+join.close()                                 # releases this handle object only
+```
+
+`Join.close()` only releases the Python object -- the join read (identity,
+handle, cursors) keeps working, so a new process can resume with just the
+work file, handle and cursor.  `join.terminate()` (or `terminate_join`) is
+the explicit "close the join" operation: the handle and every cursor stop
+verifying, and `reclaim=True` also deletes the work file.  Other joins and
+the caller's snapshots are unaffected.  `join_cleanup(path)` removes an
+unfinished (`building`) or `closed` work file -- the recovery operation
+after a killed prepare (a `ready` file is refused).
+
+The result stream is a single total order, so a cursor is just "the
+position after the last delivered result": `("m", lseq, rseq)` inside a
+left row's match group, `("l", lseq)` after an unmatched left row, or
+`("r", rseq)` in the final `right_only` phase.  Replaying a cursor seeks
+strictly after that position -- the left stream by rowid, the current
+group by `(jkey, rseq)`, the unmatched right rows by `(matched, rseq)` --
+so a page of size 1 can stop in the middle of one left row's match group
+and the next process continues with the remaining pairs of that same left
+row, then the following left rows, then (for `full`) the unmatched right
+rows: no result is ever repeated or skipped, and the work needed to resume
+is one seek, never a re-scan.  The work file stores the full declaration
+(including the snapshot tokens), which is all a new process needs besides
+the handle and cursor.
+
+## Cursor identity and source eligibility
+
+The page cursor is an HMAC-signed token bound to this read's persistent
+`join_id` and to a declaration hash covering: both collection identities,
+both snapshot ids and generations, both access-path instances (index name +
+immutable instance id + declaration hash), both canonical range queries,
+the column mapping, the mode, the null rule and the page size.  A cursor
+from another join read cannot verify -- even one declared identically.
+Replaying a cursor always yields the same page and the same next cursor,
+independently in any number of processes.
+
+Source eligibility is re-verified at prepare start, at prepare commit, and
+on **every page**: a released snapshot token, a deleted or same-name-
+replaced index instance, or a collection file replaced by another
+collection fails the call with the offending side named (`left source:` /
+`right source:`).  A prepare killed mid-way (real process kill tested)
+leaves a `building` file that can never serve pages; `join_cleanup` removes
+it and the prepare can be rerun.  A page request and a concurrent
+revocation take effect in one complete order -- a page either verifies
+fully before delivering or refuses; it never reports a mixed state.
+
+## Join commands
+
+```bash
+python bytekey_cli.py join-prepare --work join.db \
+    --left-collection  L.db --left-token  "$LTOK" [--left-index  by_qty] \
+    --left-query  lq.json \
+    --right-collection R.db --right-token "$RTOK" [--right-index by_label] \
+    --right-query rq.json \
+    --mapping mapping.json --mode full [--nulls-equal] --page-size 1
+python bytekey_cli.py join-page    --work join.db --handle "$H" [--cursor "$CUR"]
+python bytekey_cli.py join-status  --work join.db
+python bytekey_cli.py join-close   --work join.db --handle "$H" [--reclaim]
+python bytekey_cli.py join-cleanup --work join.db
+```
+
+`--mapping` accepts `{"left": [...], "right": [...]}` or
+`[[left_col, right_col], ...]`; bytes values keep the `{"__hex__": "..."}`
+convention everywhere.  `join-page` delivers exactly one page per
+invocation; all errors print a locatable message and exit nonzero (2).
+
+## Access evidence
+
+Prepare reports, per side, the real storage work of its filtered scan
+(`candidates_examined`, `invisible_versions_skipped`, `full_row_lookups`,
+`rows_written`), the work-file bytes, and the duplicate-group report
+(`max_*_group`, `*_duplicate_groups`, `groups_disk_resident: true` --
+groups are disk runs by construction, never memory buffers).  Every page
+reports `left_rows_examined`, `right_candidates_examined`, `full_row_reads`,
+the delivered `pairs`/`left_only`/`right_only` counts, the per-side
+eligibility checks, and the work-file `EXPLAIN QUERY PLAN` (a
+`SEARCH ... USING INDEX ... (jkey=? AND rseq>?)` seek for probes).  Later
+pages never re-traverse the sources, earlier pairs, or a whole duplicate
+group: mid-group pages examine at most `page_size + 1` right candidates.
+
+`demo/demo_join.py` runs the mandated fixture (l1..l4 x r1..r4, full and
+nulls_equal), the corrections-plus-history-continuation scenario, the
+two-index filtered join with pinned old-generation values, and a generated
+40x60 duplicate group consumed segment by segment:
+
+```bash
+python3 -I demo/demo_join.py          # writes demo/join_report/report.json
+```
+
+## Join tests
+
+```bash
+python3 -I tests/test_join.py         # fixture, modes, nulls, lifecycle, crashes
+python3 -I tests/test_join_random.py  # randomized differential vs double-loop oracle
+python3 -I tests/test_join_cli.py     # CLI lifecycle and failure exits
+```
+
+The randomized suite computes expectations with an independent double loop
+over plain values (never the production joiner), across random schemas,
+mappings, modes, null rules, filters, access paths and generations.
+
+
 

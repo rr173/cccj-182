@@ -31,6 +31,14 @@ from .collection import (
     import_from_index,
     open_collection,
 )
+from .join import (
+    JoinSource,
+    join_cleanup,
+    join_status,
+    open_join,
+    prepare_join,
+    terminate_join,
+)
 from .secondary import (
     SecondaryDeclaration,
     SecondaryError,
@@ -531,6 +539,95 @@ def cmd_index_range(args: argparse.Namespace) -> int:
     return 0
 
 
+# ---------------------------------------------------------------------------
+# Disk-backed two-source equi-join commands
+# ---------------------------------------------------------------------------
+
+def _coerce_join_query(collection: str, index_name: str | None, query_path: str) -> dict:
+    """Load a JSON query and coerce its values against the collection schema."""
+    with open_collection(collection) as coll:
+        raw = _load_json(query_path)
+        if not isinstance(raw, dict):
+            raise SystemExit("query JSON must be an object")
+        columns = None
+        if index_name is not None:
+            match = next((i for i in coll.list_indexes() if i.name == index_name),
+                         None)
+            if match is not None:
+                columns = [c["name"] for c in match.declaration.get("columns", [])]
+        return _coerce_query(coll.schema, raw, columns=columns)
+
+
+def _join_source_args(args: argparse.Namespace, side: str) -> JoinSource:
+    collection = getattr(args, f"{side}_collection")
+    token = getattr(args, f"{side}_token")
+    index_name = getattr(args, f"{side}_index")
+    query = _coerce_join_query(
+        collection, index_name, getattr(args, f"{side}_query")
+    )
+    return JoinSource(
+        collection=collection, token=token, query=query, index=index_name,
+    )
+
+
+def _join_row_json(row) -> dict:
+    def side_json(side):
+        if side is None:
+            return None
+        return {
+            "row_id": {"__hex__": side.row_id.hex()},
+            "values": list(side.values),
+        }
+
+    return {"kind": row.kind, "left": side_json(row.left),
+            "right": side_json(row.right)}
+
+
+def cmd_join_prepare(args: argparse.Namespace) -> int:
+    mapping = _load_json(args.mapping)
+    result = prepare_join(
+        args.work,
+        left=_join_source_args(args, "left"),
+        right=_join_source_args(args, "right"),
+        mapping=mapping,
+        mode=args.mode,
+        nulls_equal=bool(args.nulls_equal),
+        page_size=args.page_size,
+    )
+    _emit(result)
+    return 0
+
+
+def cmd_join_page(args: argparse.Namespace) -> int:
+    with open_join(args.work, args.handle) as join:
+        page, stats = join.page(args.cursor)
+        _emit({
+            "status": "page",
+            "join_id": page.join_id,
+            "declaration_hash": page.declaration_hash,
+            "rows": [_join_row_json(r) for r in page.rows],
+            "next_cursor": page.next_cursor,
+            "stats": stats.to_dict(),
+        })
+    return 0
+
+
+def cmd_join_close(args: argparse.Namespace) -> int:
+    result = terminate_join(args.work, args.handle, reclaim=bool(args.reclaim))
+    _emit({"status": "join_closed", **result})
+    return 0
+
+
+def cmd_join_cleanup(args: argparse.Namespace) -> int:
+    _emit({"status": "join_cleaned", **join_cleanup(args.work)})
+    return 0
+
+
+def cmd_join_status(args: argparse.Namespace) -> int:
+    _emit(join_status(args.work))
+    return 0
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog="bytekey", description=__doc__)
     sub = parser.add_subparsers(dest="command", required=True)
@@ -673,6 +770,51 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--page-size", type=int, default=100)
     p.add_argument("--cursor", default=None)
     p.set_defaults(func=cmd_index_range)
+
+    # -- disk-backed two-source equi-join -----------------------------------
+    p = sub.add_parser("join-prepare",
+                       help="build the work file for one join read")
+    p.add_argument("--work", required=True, help="join work file to create")
+    for side in ("left", "right"):
+        p.add_argument(f"--{side}-collection", required=True)
+        p.add_argument(f"--{side}-token", required=True,
+                       help="existing snapshot token for this side")
+        p.add_argument(f"--{side}-index", default=None,
+                       help="ready secondary index name (default: main order)")
+        p.add_argument(f"--{side}-query", required=True,
+                       help="JSON bytekey range query filtering this side")
+    p.add_argument("--mapping", required=True,
+                   help='JSON column mapping: {"left": [...], "right": [...]} '
+                        "or [[left_col, right_col], ...]")
+    p.add_argument("--mode", choices=["inner", "left", "full"], required=True)
+    p.add_argument("--nulls-equal", action="store_true",
+                   help="treat null join-key components as equal")
+    p.add_argument("--page-size", type=int, required=True,
+                   help="fixed page size bound into this join read")
+    p.set_defaults(func=cmd_join_prepare)
+
+    p = sub.add_parser("join-page", help="deliver exactly one join page")
+    p.add_argument("--work", required=True)
+    p.add_argument("--handle", required=True)
+    p.add_argument("--cursor", default=None)
+    p.set_defaults(func=cmd_join_page)
+
+    p = sub.add_parser("join-close",
+                       help="end the join read (handle and cursors expire)")
+    p.add_argument("--work", required=True)
+    p.add_argument("--handle", required=True)
+    p.add_argument("--reclaim", action="store_true",
+                   help="also delete the work file")
+    p.set_defaults(func=cmd_join_close)
+
+    p = sub.add_parser("join-cleanup",
+                       help="delete an unfinished or closed join work file")
+    p.add_argument("--work", required=True)
+    p.set_defaults(func=cmd_join_cleanup)
+
+    p = sub.add_parser("join-status", help="show a join work file's state")
+    p.add_argument("--work", required=True)
+    p.set_defaults(func=cmd_join_status)
     return parser
 
 
@@ -684,6 +826,10 @@ def main(argv: list[str] | None = None) -> int:
         # Storage-level failures (unwritable path, locked/corrupt file) are
         # presented as ordinary domain errors rather than raw tracebacks.
         print(f"error: storage failure: {exc}", file=sys.stderr)
+        return 2
+    except KeyError as exc:
+        # Unknown column/key references (e.g. in a query or mapping).
+        print(f"error: unknown column or key: {exc}", file=sys.stderr)
         return 2
     except (json.JSONDecodeError, OSError, ValueError, RuntimeError) as exc:
         # All domain errors derive from ValueError (Encoding/Query/Cursor/
