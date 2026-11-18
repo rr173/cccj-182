@@ -1,0 +1,67 @@
+{
+  "query": {
+    "shape": "prefix_range",
+    "prefix": [
+      [
+        "ts",
+        20
+      ]
+    ],
+    "range_column": "region",
+    "lo": "c",
+    "hi": "c"
+  },
+  "plan": {
+    "kind": "prefix_range",
+    "reverse_delivery": false,
+    "interval_count": 1,
+    "intervals": [
+      {
+        "lower_hex": "fb7fffffffffffffeb05630000",
+        "upper_hex": "fb7fffffffffffffeb05630001"
+      }
+    ],
+    "residual_checks": [
+      "none: null exclusion, endpoint openness and prefix equality are all expressed by the byte bounds; rows outside the intervals are never decoded"
+    ],
+    "query_spec": {
+      "hi": "c",
+      "hi_inclusive": true,
+      "lo": "c",
+      "lo_inclusive": true,
+      "prefix": [
+        [
+          "ts",
+          20
+        ]
+      ],
+      "range_column": "region",
+      "shape": "prefix_range"
+    },
+    "prefix_columns": [
+      "ts"
+    ],
+    "range_column": "region"
+  },
+  "explain_query_plan": [
+    {
+      "id": 3,
+      "parent": 0,
+      "notused": 0,
+      "detail": "SEARCH bytekey_sec_entries USING PRIMARY KEY (instance_id=? AND index_key>? AND index_key<?)"
+    }
+  ],
+  "index_candidates_examined": 2,
+  "full_row_lookups": 1,
+  "rows_delivered": 1,
+  "rows": [
+    [
+      [
+        "c",
+        20,
+        "newer"
+      ],
+      "7231"
+    ]
+  ]
+}

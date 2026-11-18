@@ -14,6 +14,13 @@ and resume positions.
   cursor from one snapshot cannot be replayed against another snapshot of the
   same generation), the canonical query spec, the page size and the last full
   encoded key delivered.
+
+* A **secondary-index cursor** is a distinct token kind (``icur``).  Besides
+  the snapshot binding it carries the index name, the immutable index
+  *instance* id (so a same-name rebuild can never continue an old cursor), a
+  hash of the resolved declaration, and the last secondary key / row_id /
+  creation generation.  Main-order cursors and secondary cursors are not
+  interchangeable.
 """
 from __future__ import annotations
 
@@ -176,3 +183,89 @@ def decode_collection_cursor(token: str, secret: str) -> CollectionCursor:
         )
     except (KeyError, TypeError, ValueError) as exc:
         raise TokenError("cursor token is missing or carries invalid fields") from exc
+
+
+# ---------------------------------------------------------------------------
+# Secondary-index pagination cursors
+# ---------------------------------------------------------------------------
+
+@dataclass(frozen=True)
+class SecondaryCursor:
+    collection_id: str
+    sid: str
+    gen: int
+    query_spec: dict
+    page_size: int
+    index_name: str
+    instance_id: str
+    declaration_hash: str
+    last_index_key: bytes      # full encoded secondary key (declaration + rid)
+    last_rid: bytes
+    last_cgen: int
+    db_path: str
+
+
+def encode_secondary_cursor(
+    *,
+    secret: str,
+    collection_id: str,
+    sid: str,
+    gen: int,
+    query_spec: Mapping[str, Any],
+    page_size: int,
+    index_name: str,
+    instance_id: str,
+    declaration_hash: str,
+    last_index_key: bytes,
+    last_rid: bytes,
+    last_cgen: int,
+    db_path: str,
+) -> str:
+    if not isinstance(page_size, int) or page_size <= 0:
+        raise TokenError("page_size must be a positive integer")
+    if not isinstance(last_index_key, (bytes, bytearray)) or not last_index_key:
+        raise TokenError("secondary cursor requires a non-empty last_index_key")
+    if not isinstance(last_rid, (bytes, bytearray)) or not last_rid:
+        raise TokenError("secondary cursor requires a non-empty last_rid")
+    return _pack(
+        {
+            "v": TOKEN_VERSION,
+            "k": "icur",
+            "cid": collection_id,
+            "sid": sid,
+            "gen": int(gen),
+            "q": canonical_query_spec(query_spec),
+            "ps": int(page_size),
+            "in": index_name,
+            "iid": instance_id,
+            "ih": declaration_hash,
+            "lk": _b64url(bytes(last_index_key)),
+            "lr": _b64url(bytes(last_rid)),
+            "lc": int(last_cgen),
+            "path": db_path,
+        },
+        secret,
+    )
+
+
+def decode_secondary_cursor(token: str, secret: str) -> SecondaryCursor:
+    body = _unpack(token, secret, "icur")
+    try:
+        return SecondaryCursor(
+            collection_id=str(body["cid"]),
+            sid=str(body["sid"]),
+            gen=int(body["gen"]),
+            query_spec=dict(body["q"]),
+            page_size=int(body["ps"]),
+            index_name=str(body["in"]),
+            instance_id=str(body["iid"]),
+            declaration_hash=str(body["ih"]),
+            last_index_key=_b64url_decode(str(body["lk"])),
+            last_rid=_b64url_decode(str(body["lr"])),
+            last_cgen=int(body["lc"]),
+            db_path=str(body["path"]),
+        )
+    except (KeyError, TypeError, ValueError) as exc:
+        raise TokenError(
+            "secondary cursor token is missing or carries invalid fields"
+        ) from exc

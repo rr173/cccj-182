@@ -178,6 +178,143 @@ class CollectionCliTests(unittest.TestCase):
                             "--retain-from", "0", expect=2)
         self.assertIn("backwards", proc.stderr.lower())
 
+    def test_secondary_index_cli_lifecycle(self):
+        # Seed a collection with a batch through the CLI.
+        self.run_cli("collection-create", "--schema", self.schema_path,
+                     "--collection", self.coll)
+        batch_path = os.path.join(self.tmp.name, "b0.json")
+        with open(batch_path, "w", encoding="utf-8") as fh:
+            json.dump({"__hex__": "00"}, fh)
+        ops = os.path.join(self.tmp.name, "seed.jsonl")
+        with open(ops, "w", encoding="utf-8") as fh:
+            for rid, region, ts, blob in [
+                ("7231", "a", 10, "00ff"),
+                ("7232", "a", 10, ""),
+                ("7233", "b", 5, "00"),
+            ]:
+                fh.write(json.dumps({
+                    "op": "put", "row_id": {"__hex__": rid},
+                    "region": region, "ts": ts, "blob": {"__hex__": blob},
+                }) + "\n")
+        self.run_cli("apply", "--collection", self.coll, "--batch-id",
+                     batch_path, "--expected-head", "0", "--source", ops)
+
+        decl = os.path.join(self.tmp.name, "decl.json")
+        with open(decl, "w", encoding="utf-8") as fh:
+            json.dump({"name": "ts_region", "columns": [
+                {"name": "ts", "asc": False, "nulls_first": True},
+                {"name": "region", "asc": True, "nulls_first": True},
+            ]}, fh)
+
+        # Register: building, B = head = 1, nonzero-exit duplicate.
+        out = self.run_cli("index-register", "--collection", self.coll,
+                           "--declaration", decl)
+        reg = json.loads(out.stdout)
+        self.assertEqual(reg["status"], "building")
+        self.assertEqual(reg["start_gen"], 1)
+        proc = self.run_cli("index-register", "--collection", self.coll,
+                            "--declaration", decl, expect=2)
+        self.assertIn("already exists", proc.stderr)
+
+        # Advance with budget 1 until ready.
+        build_hex = reg["build_id_hex"]
+        for _ in range(30):
+            out = self.run_cli("index-advance", "--collection", self.coll,
+                               "--name", "ts_region", "--budget", "1",
+                               "--build-id", build_hex)
+            step = json.loads(out.stdout)
+            self.assertLessEqual(
+                step["step"]["baseline_candidates_read"] +
+                step["step"]["catchup_changes_processed"], 1)
+            if step["status"] == "ready":
+                break
+        self.assertEqual(step["status"], "ready")
+
+        # index-status / list.
+        out = self.run_cli("index-status", "--collection", self.coll)
+        listing = json.loads(out.stdout)
+        self.assertEqual(len(listing["indexes"]), 1)
+
+        # Snapshot and page through the index via the CLI, one page each.
+        out = self.run_cli("snapshot-begin", "--collection", self.coll)
+        token = json.loads(out.stdout)["snapshot_token"]
+        qpath = os.path.join(self.tmp.name, "iq.json")
+        with open(qpath, "w", encoding="utf-8") as fh:
+            json.dump({"shape": "full_tuple", "lower": None, "upper": None}, fh)
+        out = self.run_cli("index-range", "--collection", self.coll,
+                           "--name", "ts_region", "--token", token,
+                           "--query", qpath, "--page-size", "1")
+        page = json.loads(out.stdout)
+        self.assertEqual(len(page["rows"]), 1)
+        self.assertIn("index_candidates_examined", page["stats"])
+        self.assertGreater(page["stats"]["full_row_lookups"], 0)
+        seen = [page["rows"][0]["row_id"]["__hex__"]]
+        cursor = page["next_cursor"]
+        while cursor is not None:
+            out = self.run_cli("index-range", "--collection", self.coll,
+                               "--name", "ts_region", "--token", token,
+                               "--query", qpath, "--page-size", "1",
+                               "--cursor", cursor)
+            page = json.loads(out.stdout)
+            seen += [r["row_id"]["__hex__"] for r in page["rows"]]
+            cursor = page["next_cursor"]
+        self.assertEqual(sorted(seen), ["7231", "7232", "7233"])
+
+        # index-explain reports a real byte range, no full scan.
+        out = self.run_cli("index-explain", "--collection", self.coll,
+                           "--name", "ts_region", "--query", qpath)
+        explain = json.loads(out.stdout)
+        details = [d["detail"] for d in explain["explain_query_plan"]]
+        self.assertTrue(any("bytekey_sec_entries" in d for d in details))
+
+        # A token issued before B is a coverage error (nonzero exit).
+        early = json.loads(self.run_cli(
+            "snapshot-begin", "--collection", self.coll, "--gen", "0"
+        ).stdout)["snapshot_token"]
+        proc = self.run_cli("index-range", "--collection", self.coll,
+                            "--name", "ts_region", "--token", early,
+                            "--query", qpath, "--page-size", "1", expect=2)
+        self.assertIn("coverage", proc.stderr.lower())
+
+        # Delete, then old cursor is refused with a located error.
+        self.run_cli("index-delete", "--collection", self.coll,
+                     "--name", "ts_region")
+        proc = self.run_cli("index-range", "--collection", self.coll,
+                            "--name", "ts_region", "--token", token,
+                            "--query", qpath, "--page-size", "1", expect=2)
+        self.assertIn("no live", proc.stderr.lower())
+
+    def test_index_cursor_errors_are_located(self):
+        self.run_cli("collection-create", "--schema", self.schema_path,
+                     "--collection", self.coll)
+        bid = os.path.join(self.tmp.name, "b.json")
+        with open(bid, "w", encoding="utf-8") as fh:
+            json.dump({"__hex__": "01"}, fh)
+        src = os.path.join(self.tmp.name, "s.jsonl")
+        with open(src, "w", encoding="utf-8") as fh:
+            fh.write(json.dumps({
+                "op": "put", "row_id": {"__hex__": "01"},
+                "region": "a", "ts": 1, "blob": {"__hex__": ""},
+            }) + "\n")
+        self.run_cli("apply", "--collection", self.coll, "--batch-id", bid,
+                     "--expected-head", "0", "--source", src)
+        decl = os.path.join(self.tmp.name, "d.json")
+        with open(decl, "w", encoding="utf-8") as fh:
+            json.dump({"name": "i", "columns": [{"name": "ts"}]}, fh)
+        self.run_cli("index-register", "--collection", self.coll,
+                     "--declaration", decl)
+        # Unknown index name is a located nonzero error.
+        proc = self.run_cli("index-advance", "--collection", self.coll,
+                            "--name", "missing", "--budget", "1", expect=2)
+        self.assertIn("no live secondary index", proc.stderr)
+        # A bad declaration (unknown column) is located and nonzero.
+        bad = os.path.join(self.tmp.name, "bad.json")
+        with open(bad, "w", encoding="utf-8") as fh:
+            json.dump({"name": "x", "columns": [{"name": "nope"}]}, fh)
+        proc = self.run_cli("index-register", "--collection", self.coll,
+                            "--declaration", bad, expect=2)
+        self.assertIn("unknown business column", proc.stderr)
+
     def test_error_locations_and_nonzero_exits(self):
         self.run_cli("collection-create", "--schema", self.schema_path,
                      "--collection", self.coll)

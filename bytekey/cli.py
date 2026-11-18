@@ -2,7 +2,10 @@
 
 Plus the updatable-collection operations: ``collection-create``,
 ``collection-import``, ``apply``, ``snapshot-begin``, ``snapshot-release``,
-``snapshot-range``, ``collect-history`` and ``status``.
+``snapshot-range``, ``collect-history`` and ``status``, and the named
+secondary access index operations ``index-register``, ``index-advance``,
+``index-status``, ``index-explain``, ``index-range``, ``index-cancel`` and
+``index-delete``.
 
 All JSON ``bytes`` values use the single-field object form ``{"__hex__": "..."}``
 on input and output (row_id, batch_id and every bytes-typed column alike).
@@ -27,6 +30,10 @@ from .collection import (
     create_collection,
     import_from_index,
     open_collection,
+)
+from .secondary import (
+    SecondaryDeclaration,
+    SecondaryError,
 )
 
 
@@ -119,24 +126,37 @@ def _load_rows(path: str, schema: Schema):
         yield _coerce_row(schema, row)
 
 
-def _coerce_query(schema: Schema, query: dict) -> dict:
+def _coerce_query(
+    schema: Schema, query: dict, *, columns: list[str] | None = None,
+    declaration: bool = False,
+) -> dict:
+    """Coerce JSON query values to their declared column types.
+
+    ``columns`` (the index declaration's ordered business column names) is
+    used when the query is interpreted against a secondary index; default is
+    the main schema order.
+    """
+    if declaration:
+        raise TypeError("declaration is selected via `columns`")
+    names = list(columns) if columns is not None else [c.name for c in schema.columns]
+    cols = [schema.column(n) for n in names]
     out = dict(query)
     shape = query.get("shape")
     if shape == "full_tuple":
         for side in ("lower", "upper"):
             if out.get(side) is not None:
                 out[side] = [
-                    _coerce_value(col.kind, v)
-                    for col, v in zip(schema.columns, out[side])
+                    _coerce_value(col.kind, v) for col, v in zip(cols, out[side])
                 ]
     elif shape == "prefix_range":
         prefix = []
-        for item in out.get("prefix", []):
-            name, value = item
+        for name, value in out.get("prefix", []):
             col = schema.column(name)
             prefix.append([name, _coerce_value(col.kind, value)])
         out["prefix"] = prefix
-        rcol_name = out.get("range_column", schema.columns[len(prefix)].name)
+        rcol_name = out.get("range_column")
+        if rcol_name is None:
+            rcol_name = names[len(prefix)]
         rcol = schema.column(rcol_name)
         for side in ("lo", "hi"):
             if out.get(side) is not None:
@@ -386,12 +406,9 @@ def cmd_collect_history(args: argparse.Namespace) -> int:
         status = coll.status().to_dict()
     _emit({
         "status": "history_collected",
-        "retain_from": result.retain_from,
-        "previous_retain_from": result.previous_retain_from,
-        "entries_removed": result.entries_removed,
-        "active_snapshots": result.active_snapshots,
-        "head": result.head,
-        **{k: v for k, v in status.items() if k not in ("head", "retain_from")},
+        **result.to_dict(),
+        **{k: v for k, v in status.items()
+           if k not in ("head", "retain_from", "path")},
     })
     return 0
 
@@ -406,6 +423,111 @@ def cmd_explain_snapshot(args: argparse.Namespace) -> int:
     with open_collection(args.collection) as coll:
         query = _coerce_query(coll.schema, _load_json(args.query))
         _emit(coll.explain_snapshot_scan(query, args.page_size))
+    return 0
+
+
+# ---------------------------------------------------------------------------
+# Secondary access index commands
+# ---------------------------------------------------------------------------
+
+def _load_declaration(path: str) -> SecondaryDeclaration:
+    return SecondaryDeclaration.from_dict(_load_json(path))
+
+
+def cmd_index_register(args: argparse.Namespace) -> int:
+    with open_collection(args.collection) as coll:
+        declaration = _load_declaration(args.declaration)
+        result = coll.register_index(declaration)
+    _emit({"status": "index_registered", **result})
+    return 0
+
+
+def cmd_index_advance(args: argparse.Namespace) -> int:
+    with open_collection(args.collection) as coll:
+        expected = None if args.build_id is None else bytes.fromhex(args.build_id)
+        status = coll.advance_index(args.name, args.budget,
+                                    expected_build_id=expected)
+        payload = status.to_dict()
+    _emit({"status": "index_advanced", **payload})
+    return 0
+
+
+def cmd_index_status(args: argparse.Namespace) -> int:
+    with open_collection(args.collection) as coll:
+        if args.name is None:
+            _emit({
+                "status": "index_list",
+                "indexes": [
+                    {**i.to_dict(), "progress": coll.index_status(i.name).to_dict()}
+                    for i in coll.list_indexes()
+                ],
+            })
+        else:
+            _emit({"status": "index_status",
+                   **coll.index_status(args.name).to_dict()})
+    return 0
+
+
+def cmd_index_cancel(args: argparse.Namespace) -> int:
+    with open_collection(args.collection) as coll:
+        _emit({"status": "index_cancelled", **coll.cancel_index(args.name)})
+    return 0
+
+
+def cmd_index_delete(args: argparse.Namespace) -> int:
+    with open_collection(args.collection) as coll:
+        result = coll.delete_index(args.name, instance_id=args.instance_id)
+    _emit({"status": "index_deleted", **result})
+    return 0
+
+
+def cmd_index_explain(args: argparse.Namespace) -> int:
+    with open_collection(args.collection) as coll:
+        index_info = next(
+            (i for i in coll.list_indexes(include_deleted=False)
+             if i.name == args.name),
+            None,
+        )
+        if index_info is None:
+            raise SecondaryError(f"no live secondary index named {args.name!r}")
+        columns = [c["name"] for c in index_info.declaration.get("columns", [])]
+        query = _coerce_query(coll.schema, _load_json(args.query), columns=columns)
+        _emit(coll.explain_index_scan(args.name, query, args.page_size))
+    return 0
+
+
+def cmd_index_range(args: argparse.Namespace) -> int:
+    with open_collection(args.collection) as coll:
+        info = coll.list_indexes()
+        match = next((i for i in info if i.name == args.name), None)
+        columns = None
+        if match is not None:
+            columns = [c["name"] for c in match.declaration.get("columns", [])]
+        query = _coerce_query(
+            coll.schema, _load_json(args.query), columns=columns,
+        )
+        page, stats, plan = coll.scan_index_page(
+            args.token, args.name, query, args.page_size,
+            cursor_token=args.cursor,
+        )
+        _emit({
+            "status": "page",
+            "gen": page.gen,
+            "sid": page.sid,
+            "index": page.index_name,
+            "instance_id": page.instance_id,
+            "plan": plan.explain(),
+            "rows": [
+                {"values": list(values),
+                 coll.row_id_name: {"__hex__": rid.hex()}}
+                for values, rid in page.rows
+            ],
+            "next_cursor": page.next_cursor,
+            "last_index_key_hex": (
+                page.last_index_key.hex() if page.last_index_key else None
+            ),
+            "stats": stats.to_dict(),
+        })
     return 0
 
 
@@ -500,6 +622,57 @@ def build_parser() -> argparse.ArgumentParser:
     p = sub.add_parser("status", help="show collection generations, entries and snapshots")
     p.add_argument("--collection", required=True)
     p.set_defaults(func=cmd_status)
+
+    # -- named secondary access indexes -----------------------------------
+    p = sub.add_parser("index-register",
+                       help="register a named secondary index (coverage start = head)")
+    p.add_argument("--collection", required=True)
+    p.add_argument("--declaration", required=True,
+                   help="JSON index declaration (name + ordered columns)")
+    p.set_defaults(func=cmd_index_register)
+
+    p = sub.add_parser("index-advance",
+                       help="do at most N units of baseline/catch-up work and commit")
+    p.add_argument("--collection", required=True)
+    p.add_argument("--name", required=True)
+    p.add_argument("--budget", type=int, required=True)
+    p.add_argument("--build-id", default=None, help="hex build handle (resume)")
+    p.set_defaults(func=cmd_index_advance)
+
+    p = sub.add_parser("index-status", help="show one index (or list all) progress")
+    p.add_argument("--collection", required=True)
+    p.add_argument("--name", default=None)
+    p.set_defaults(func=cmd_index_status)
+
+    p = sub.add_parser("index-cancel", help="cancel a building secondary index")
+    p.add_argument("--collection", required=True)
+    p.add_argument("--name", required=True)
+    p.set_defaults(func=cmd_index_cancel)
+
+    p = sub.add_parser("index-delete", help="retire a named index instance")
+    p.add_argument("--collection", required=True)
+    p.add_argument("--name", required=True)
+    p.add_argument("--instance-id", default=None,
+                   help="refuse if the name now refers to a different instance")
+    p.set_defaults(func=cmd_index_delete)
+
+    p = sub.add_parser("index-explain",
+                       help="show intervals and SQLite plan of an index scan")
+    p.add_argument("--collection", required=True)
+    p.add_argument("--name", required=True)
+    p.add_argument("--query", required=True)
+    p.add_argument("--page-size", type=int, default=100)
+    p.set_defaults(func=cmd_index_explain)
+
+    p = sub.add_parser("index-range",
+                       help="read one page through a ready secondary index")
+    p.add_argument("--collection", required=True)
+    p.add_argument("--name", required=True)
+    p.add_argument("--token", required=True)
+    p.add_argument("--query", required=True)
+    p.add_argument("--page-size", type=int, default=100)
+    p.add_argument("--cursor", default=None)
+    p.set_defaults(func=cmd_index_range)
     return parser
 
 

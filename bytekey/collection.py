@@ -47,7 +47,19 @@ History collection
 physically deletes exactly the dead entries no retained generation and no
 active snapshot can read.  Active snapshot tokens pin every entry their
 generation can see; only after the last protecting token is released can a
-later collection remove them.
+later collection remove them.  Secondary-index versions and journal rows obey
+the same rule, and an in-flight build protects its own inputs.
+
+Named secondary access indexes
+------------------------------
+
+``register_index`` / ``advance_index`` / ``scan_index_page`` add a second,
+named access order over a subset of the existing business columns (see
+``bytekey.secondary`` for the declaration and storage model).  An index is
+built in budgeted, resumable steps under short transactions, becomes queryable
+only at an explicit ready switch that is guaranteed to cover every generation
+from its start ``B`` to the then-current head, and is maintained by every
+later apply in the same commit as the main version, head and receipt.
 """
 from __future__ import annotations
 
@@ -62,13 +74,32 @@ from typing import Any, Callable, Iterable, Mapping, Sequence
 from .encoding import EncodingError, key_decode, key_encode
 from .planner import Interval, QueryPlan, plan_query
 from .schema import Schema
+from .secondary import (
+    BUILDING,
+    READY,
+    SEC_ENTRY_TABLE,
+    SEC_INDEX_TABLE,
+    SEC_QUEUE_TABLE,
+    IndexConflictError,
+    IndexCursorError,
+    IndexNotFoundError,
+    IndexNotReadyError,
+    CoverageError,
+    SecondaryDeclaration,
+    encode_index_key,
+    plan_index_query,
+    resolve_declaration,
+    validate_query_columns,
+)
 from .snapshot import (
     CollectionCursor,
     SnapshotTicket,
     TokenError,
     decode_collection_cursor,
+    decode_secondary_cursor,
     decode_snapshot_token,
     encode_collection_cursor,
+    encode_secondary_cursor,
     encode_snapshot_token,
 )
 
@@ -77,7 +108,8 @@ KV_TABLE = "bytekey_kv"
 RECEIPT_TABLE = "bytekey_receipts"
 SNAPSHOT_TABLE = "bytekey_snapshots"
 STAGING_TABLE = "bytekey_staging"
-COLLECTION_FORMAT = "bytekey-collection/v1"
+COLLECTION_FORMAT = "bytekey-collection/v2"
+LEGACY_COLLECTION_FORMAT = "bytekey-collection/v1"
 APPLICATION_ID = 0x6279746B  # 'bytk', shared with the static index
 DIGEST_VERSION = "bytekey-batch-digest/v1"
 BUSY_TIMEOUT_MS = 10000
@@ -154,6 +186,140 @@ class HistoryStats:
     entries_removed: int
     active_snapshots: int
     head: int
+    secondary_entries_removed: int = 0
+    queue_entries_removed: int = 0
+
+    def to_dict(self) -> dict:
+        return {
+            "retain_from": self.retain_from,
+            "previous_retain_from": self.previous_retain_from,
+            "entries_removed": self.entries_removed,
+            "main_entries_removed": self.entries_removed,
+            "secondary_entries_removed": self.secondary_entries_removed,
+            "queue_entries_removed": self.queue_entries_removed,
+            "active_snapshots": self.active_snapshots,
+            "head": self.head,
+        }
+
+
+@dataclass
+class IndexBuildStatus:
+    """Progress of one named secondary index instance."""
+
+    name: str
+    instance_id: str
+    build_id: str
+    status: str
+    start_gen: int
+    declaration: dict
+    declaration_hash: str
+    head: int
+    processed_seq: int
+    next_seq: int
+    baseline_done: bool
+    baseline_cursor_key: bytes | None
+    baseline_candidates_read: int      # this step
+    catchup_changes_processed: int     # this step
+    cumulative_baseline_candidates: int
+    cumulative_catchup_changes: int
+    covered_from: int
+    ready_gen: int | None
+    secondary_entries: int
+    queue_entries: int
+
+    def to_dict(self) -> dict:
+        return {
+            "name": self.name,
+            "instance_id": self.instance_id,
+            "build_id": self.build_id,
+            "status": self.status,
+            "start_gen": self.start_gen,
+            "covered_from": self.covered_from,
+            "ready_gen": self.ready_gen,
+            "head": self.head,
+            "declaration": self.declaration,
+            "declaration_hash": self.declaration_hash,
+            "processed_seq": self.processed_seq,
+            "next_seq": self.next_seq,
+            "baseline_done": self.baseline_done,
+            "baseline_cursor_key_hex": (
+                self.baseline_cursor_key.hex()
+                if self.baseline_cursor_key is not None
+                else None
+            ),
+            "step": {
+                "baseline_candidates_read": self.baseline_candidates_read,
+                "catchup_changes_processed": self.catchup_changes_processed,
+            },
+            "cumulative": {
+                "baseline_candidates_read": self.cumulative_baseline_candidates,
+                "catchup_changes_processed": self.cumulative_catchup_changes,
+            },
+            "secondary_entries": self.secondary_entries,
+            "queue_entries": self.queue_entries,
+        }
+
+
+@dataclass
+class IndexScanStats:
+    index_candidates_examined: int    # secondary entries pulled from storage
+    invisible_versions_skipped: int
+    full_row_lookups: int             # main-version locator seeks
+    rows_delivered: int
+    has_more: bool
+    used_index: bool
+    explain_query_plan: list[dict]
+    intervals: list[dict]
+
+    def to_dict(self) -> dict:
+        return {
+            "index_candidates_examined": self.index_candidates_examined,
+            "invisible_versions_skipped": self.invisible_versions_skipped,
+            "full_row_lookups": self.full_row_lookups,
+            "rows_delivered": self.rows_delivered,
+            "has_more": self.has_more,
+            "used_index": self.used_index,
+            "explain_query_plan": self.explain_query_plan,
+            "intervals": self.intervals,
+        }
+
+
+@dataclass
+class IndexPage:
+    rows: list[tuple[tuple, bytes]]
+    next_cursor: str | None
+    last_index_key: bytes | None
+    gen: int
+    sid: str
+    index_name: str
+    instance_id: str
+
+
+@dataclass
+class IndexInfo:
+    name: str
+    instance_id: str
+    build_id: str
+    status: str
+    start_gen: int
+    declaration: dict
+    declaration_hash: str
+    ready_gen: int | None
+    baseline_done: bool
+
+    def to_dict(self) -> dict:
+        return {
+            "name": self.name,
+            "instance_id": self.instance_id,
+            "build_id": self.build_id,
+            "status": self.status,
+            "start_gen": self.start_gen,
+            "covered_from": self.start_gen,
+            "ready_gen": self.ready_gen,
+            "declaration": self.declaration,
+            "declaration_hash": self.declaration_hash,
+            "baseline_done": self.baseline_done,
+        }
 
 
 @dataclass
@@ -169,6 +335,7 @@ class CollectionStatus:
     dead_entries: int
     receipt_count: int
     active_snapshots: list[dict] = field(default_factory=list)
+    indexes: list[dict] = field(default_factory=list)
 
     def to_dict(self) -> dict:
         return {
@@ -183,6 +350,7 @@ class CollectionStatus:
             "dead_entries": self.dead_entries,
             "receipt_count": self.receipt_count,
             "active_snapshots": list(self.active_snapshots),
+            "indexes": list(self.indexes),
         }
 
 
@@ -281,6 +449,84 @@ def _create_schema_objects(conn: sqlite3.Connection) -> None:
         "rid BLOB NOT NULL, kind TEXT NOT NULL, encoded_key BLOB, "
         "canon BLOB NOT NULL, PRIMARY KEY(batch_id, rid)) WITHOUT ROWID"
     )
+    _ensure_secondary_schema(conn)
+
+
+def _ensure_secondary_schema(conn: sqlite3.Connection) -> None:
+    """Create the secondary-index tables if absent (idempotent, recoverable).
+
+    Also used as the v1 -> v2 format upgrade: running it repeatedly is safe,
+    so an interrupted migration simply runs again on the next open.
+    """
+    conn.execute(
+        f"CREATE TABLE IF NOT EXISTS {SEC_INDEX_TABLE} ("
+        "instance_id TEXT PRIMARY KEY, name TEXT NOT NULL, "
+        "build_id TEXT NOT NULL, status TEXT NOT NULL, "
+        "start_gen INTEGER NOT NULL, declaration_json TEXT NOT NULL, "
+        "declaration_hash TEXT NOT NULL, "
+        "next_seq INTEGER NOT NULL DEFAULT 1, "
+        "processed_seq INTEGER NOT NULL DEFAULT 0, "
+        "baseline_cursor_key BLOB, baseline_cursor_rid BLOB, "
+        "baseline_cursor_cgen INTEGER, "
+        "baseline_done INTEGER NOT NULL DEFAULT 0, "
+        "ready_gen INTEGER, created_seq INTEGER NOT NULL, "
+        "baseline_candidates INTEGER NOT NULL DEFAULT 0, "
+        "catchup_changes INTEGER NOT NULL DEFAULT 0) WITHOUT ROWID"
+    )
+    # One *active* index per name; a deleted/cancelled instance frees the name
+    # for a different declaration while its old identity remains resolvable
+    # (and therefore always rejected by old cursors).
+    conn.execute(
+        "CREATE UNIQUE INDEX IF NOT EXISTS bytekey_sec_active_name "
+        f"ON {SEC_INDEX_TABLE}(name) WHERE status IN ('building','ready')"
+    )
+    conn.execute(
+        "CREATE UNIQUE INDEX IF NOT EXISTS bytekey_sec_build_id "
+        f"ON {SEC_INDEX_TABLE}(build_id)"
+    )
+    conn.execute(
+        f"CREATE TABLE IF NOT EXISTS {SEC_ENTRY_TABLE} ("
+        "instance_id TEXT NOT NULL, index_key BLOB NOT NULL, "
+        "cgen INTEGER NOT NULL, dgen INTEGER, rid BLOB NOT NULL, "
+        "main_key BLOB NOT NULL, main_cgen INTEGER NOT NULL, "
+        "PRIMARY KEY(instance_id, index_key, cgen)) WITHOUT ROWID"
+    )
+    # Cleanup helper only; queries use the primary key range.
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS bytekey_sec_entries_dead "
+        f"ON {SEC_ENTRY_TABLE}(instance_id, dgen)"
+    )
+    conn.execute(
+        f"CREATE TABLE IF NOT EXISTS {SEC_QUEUE_TABLE} ("
+        "instance_id TEXT NOT NULL, seq INTEGER NOT NULL, "
+        "kind TEXT NOT NULL, index_key BLOB NOT NULL, rid BLOB NOT NULL, "
+        "cgen INTEGER NOT NULL, main_key BLOB NOT NULL, close_gen INTEGER, "
+        "PRIMARY KEY(instance_id, seq)) WITHOUT ROWID"
+    )
+
+
+def _migrate_collection(conn: sqlite3.Connection, fmt: str) -> None:
+    """Recoverably upgrade a legacy collection in place.
+
+    Collection identity, head, receipts, snapshots and every version row are
+    untouched; only new (initially empty) secondary-index objects are added
+    and the format marker is advanced.
+    """
+    if fmt == COLLECTION_FORMAT:
+        return
+    if fmt != LEGACY_COLLECTION_FORMAT:
+        raise CollectionError(f"unsupported collection format {fmt!r}")
+    try:
+        conn.execute("BEGIN IMMEDIATE")
+        _ensure_secondary_schema(conn)
+        conn.execute(
+            f"UPDATE {META_TABLE} SET value = ? WHERE name = 'format'",
+            (COLLECTION_FORMAT,),
+        )
+        conn.commit()
+    except BaseException:
+        conn.rollback()
+        raise
 
 
 def create_collection(path: str, schema: Schema) -> str:
@@ -442,7 +688,20 @@ class Collection:
             self._close_connections()
             raise CollectionError(f"not a bytekey database: {path}") from exc
         meta = dict(meta_rows)
-        if meta.get("format") != COLLECTION_FORMAT:
+        fmt = meta.get("format")
+        if fmt == LEGACY_COLLECTION_FORMAT:
+            # Recoverable in-place upgrade: identity, head, receipts and
+            # snapshots are preserved; only empty secondary objects are added.
+            try:
+                _migrate_collection(self.writer, fmt)
+            except BaseException:
+                self._close_connections()
+                raise
+            meta = dict(
+                self.writer.execute(f"SELECT name, value FROM {META_TABLE}").fetchall()
+            )
+            fmt = meta.get("format")
+        if fmt != COLLECTION_FORMAT:
             self._close_connections()
             raise CollectionError(
                 f"{path!r} is not an updatable collection "
@@ -679,6 +938,87 @@ class Collection:
             new_head = head + 1
             applied = 0
             noop = 0
+            # Building secondary indexes must cover everything published from
+            # their start generation B on.  The journal is written in this
+            # very transaction (same commit as the main version + receipt),
+            # and it is derived from the *declaration* of every building
+            # instance -- never from a connection-time directory, so a writer
+            # connection opened before registration still maintains it.
+            building = self.writer.execute(
+                f"SELECT instance_id, declaration_json FROM {SEC_INDEX_TABLE} "
+                "WHERE status = 'building' ORDER BY instance_id"
+            ).fetchall()
+            building_indexes = [
+                (iid, resolve_declaration(self.schema, SecondaryDeclaration.from_json(dj)))
+                for iid, dj in building
+            ]
+            queue_seq: dict[str, int] = {}
+            if building_indexes:
+                for iid, _decl in building_indexes:
+                    queue_seq[iid] = self.writer.execute(
+                        f"SELECT next_seq FROM {SEC_INDEX_TABLE} "
+                        "WHERE instance_id = ?",
+                        (iid,),
+                    ).fetchone()[0]
+
+            def journal_open(iid: str, decl, key: bytes, rid: bytes,
+                             values: tuple, gen: int) -> None:
+                idx_key = encode_index_key(self.schema, decl, values, rid)
+                seq = queue_seq[iid]
+                queue_seq[iid] = seq + 1
+                self.writer.execute(
+                    f"INSERT INTO {SEC_QUEUE_TABLE}"
+                    "(instance_id, seq, kind, index_key, rid, cgen, main_key, "
+                    "close_gen) VALUES (?, ?, 'open', ?, ?, ?, ?, NULL)",
+                    (iid, seq, idx_key, rid, gen, key),
+                )
+
+            def journal_close(iid: str, decl, key: bytes, rid: bytes,
+                              version_cgen: int, values: tuple,
+                              closed_gen: int) -> None:
+                idx_key = encode_index_key(self.schema, decl, values, rid)
+                seq = queue_seq[iid]
+                queue_seq[iid] = seq + 1
+                self.writer.execute(
+                    f"INSERT INTO {SEC_QUEUE_TABLE}"
+                    "(instance_id, seq, kind, index_key, rid, cgen, main_key, "
+                    "close_gen) VALUES (?, ?, 'close', ?, ?, ?, ?, ?)",
+                    (iid, seq, idx_key, rid, version_cgen, key, closed_gen),
+                )
+
+            # Ready secondary indexes are maintained *synchronously in the
+            # same transaction*: the switch to ready is an explicit commit and
+            # every later apply must keep the index exact.
+            ready = self.writer.execute(
+                f"SELECT instance_id, declaration_json FROM {SEC_INDEX_TABLE} "
+                "WHERE status = 'ready' ORDER BY instance_id"
+            ).fetchall()
+            ready_indexes = [
+                (iid, resolve_declaration(self.schema, SecondaryDeclaration.from_json(dj)))
+                for iid, dj in ready
+            ]
+
+            def ready_insert(iid: str, decl, key: bytes, rid: bytes,
+                             values: tuple, gen: int) -> None:
+                idx_key = encode_index_key(self.schema, decl, values, rid)
+                self.writer.execute(
+                    f"INSERT INTO {SEC_ENTRY_TABLE}"
+                    "(instance_id, index_key, cgen, dgen, rid, main_key, "
+                    "main_cgen) VALUES (?, ?, ?, NULL, ?, ?, ?)",
+                    (iid, idx_key, gen, rid, key, gen),
+                )
+
+            def ready_close(iid: str, decl, key: bytes, rid: bytes,
+                            version_cgen: int, values: tuple,
+                            closed_gen: int) -> None:
+                idx_key = encode_index_key(self.schema, decl, values, rid)
+                self.writer.execute(
+                    f"UPDATE {SEC_ENTRY_TABLE} SET dgen = ? "
+                    "WHERE instance_id = ? AND index_key = ? AND cgen = ? "
+                    "AND dgen IS NULL",
+                    (closed_gen, iid, idx_key, version_cgen),
+                )
+
             # Stream staged operations one row at a time: the batch source is
             # never materialized into a Python list/dict, so writer memory is
             # bounded by the staging cursor plus fixed bookkeeping.  The
@@ -690,7 +1030,7 @@ class Collection:
             )
             for rid, kind, encoded_key in staged_cursor:
                 live = self.writer.execute(
-                    f"SELECT key FROM {KV_TABLE} WHERE rid = ? AND dgen IS NULL",
+                    f"SELECT key, cgen FROM {KV_TABLE} WHERE rid = ? AND dgen IS NULL",
                     (rid,),
                 ).fetchone()
                 if kind == "d":
@@ -701,6 +1041,14 @@ class Collection:
                         f"UPDATE {KV_TABLE} SET dgen = ? WHERE rid = ? AND dgen IS NULL",
                         (new_head, rid),
                     )
+                    if building_indexes or ready_indexes:
+                        old_values, _ = key_decode(self.schema, live[0])
+                        for iid, decl in building_indexes:
+                            journal_close(iid, decl, live[0], rid, live[1],
+                                          old_values, new_head)
+                        for iid, decl in ready_indexes:
+                            ready_close(iid, decl, live[0], rid, live[1],
+                                       old_values, new_head)
                     applied += 1
                 else:
                     if live is None:
@@ -709,6 +1057,14 @@ class Collection:
                             "(key, rid, cgen, dgen) VALUES (?, ?, ?, NULL)",
                             (encoded_key, rid, new_head),
                         )
+                        if building_indexes or ready_indexes:
+                            values, _ = key_decode(self.schema, encoded_key)
+                            for iid, decl in building_indexes:
+                                journal_open(iid, decl, encoded_key, rid,
+                                             values, new_head)
+                            for iid, decl in ready_indexes:
+                                ready_insert(iid, decl, encoded_key, rid,
+                                             values, new_head)
                         applied += 1
                     elif live[0] == encoded_key:
                         noop += 1  # identical full replacement
@@ -723,7 +1079,27 @@ class Collection:
                             "(key, rid, cgen, dgen) VALUES (?, ?, ?, NULL)",
                             (encoded_key, rid, new_head),
                         )
+                        if building_indexes or ready_indexes:
+                            old_values, _ = key_decode(self.schema, live[0])
+                            new_values, _ = key_decode(self.schema, encoded_key)
+                            for iid, decl in building_indexes:
+                                journal_close(iid, decl, live[0], rid, live[1],
+                                              old_values, new_head)
+                                journal_open(iid, decl, encoded_key, rid,
+                                             new_values, new_head)
+                            for iid, decl in ready_indexes:
+                                ready_close(iid, decl, live[0], rid, live[1],
+                                           old_values, new_head)
+                                ready_insert(iid, decl, encoded_key, rid,
+                                             new_values, new_head)
                         applied += 1
+
+            for iid, seq in queue_seq.items():
+                self.writer.execute(
+                    f"UPDATE {SEC_INDEX_TABLE} SET next_seq = ? "
+                    "WHERE instance_id = ?",
+                    (seq, iid),
+                )
 
             self.writer.execute(
                 f"INSERT INTO {RECEIPT_TABLE}"
@@ -764,7 +1140,534 @@ class Collection:
             self._rollback()
             raise
 
-    # -- snapshots ---------------------------------------------------------
+    # -- secondary index lifecycle ----------------------------------------
+
+    def _index_row(self, name: str) -> tuple:
+        row = self.reader.execute(
+            f"SELECT instance_id, name, build_id, status, start_gen, "
+            "declaration_json, declaration_hash, next_seq, processed_seq, "
+            "baseline_cursor_key, baseline_cursor_rid, baseline_cursor_cgen, "
+            "baseline_done, ready_gen, created_seq, baseline_candidates, "
+            "catchup_changes "
+            f"FROM {SEC_INDEX_TABLE} WHERE name = ? AND status IN "
+            "('building','ready')",
+            (name,),
+        ).fetchone()
+        if row is None:
+            raise IndexNotFoundError(f"no live secondary index named {name!r}")
+        return row
+
+    def _index_row_by_instance(self, instance_id: str) -> tuple | None:
+        return self.reader.execute(
+            f"SELECT instance_id, name, build_id, status, start_gen, "
+            "declaration_json, declaration_hash, next_seq, processed_seq, "
+            "baseline_cursor_key, baseline_cursor_rid, baseline_cursor_cgen, "
+            "baseline_done, ready_gen, created_seq, baseline_candidates, "
+            "catchup_changes "
+            f"FROM {SEC_INDEX_TABLE} WHERE instance_id = ?",
+            (instance_id,),
+        ).fetchone()
+
+    @staticmethod
+    def _index_row_dict(row: tuple) -> dict:
+        (iid, name, build_id, status, start_gen, dj, dh, next_seq, processed,
+         cur_key, cur_rid, cur_cgen, baseline_done, ready_gen, created_seq,
+         base_count, catchup) = row
+        return {
+            "instance_id": iid,
+            "name": name,
+            "build_id": build_id,
+            "status": status,
+            "start_gen": start_gen,
+            "declaration_json": dj,
+            "declaration_hash": dh,
+            "next_seq": next_seq,
+            "processed_seq": processed,
+            "baseline_cursor_key": cur_key,
+            "baseline_cursor_rid": cur_rid,
+            "baseline_cursor_cgen": cur_cgen,
+            "baseline_done": bool(baseline_done),
+            "ready_gen": ready_gen,
+            "created_seq": created_seq,
+            "baseline_candidates": base_count,
+            "catchup_changes": catchup,
+        }
+
+    def register_index(
+        self,
+        declaration: SecondaryDeclaration | Mapping[str, Any],
+        *,
+        build_id: bytes | None = None,
+    ) -> dict:
+        """Register a named secondary index and pin its coverage start B.
+
+        One short transaction mints an immutable instance identity and the
+        resumable build handle, records ``start_gen = head`` and leaves the
+        instance in ``building``.  No baseline row is read or copied here.
+        Duplicate names among *active* indexes fail explicitly; reuse the
+        returned ``build_id`` to resume the original work.
+        """
+        decl = resolve_declaration(self.schema, declaration)
+        if build_id is not None:
+            if not isinstance(build_id, (bytes, bytearray)) or not build_id:
+                raise BatchError("build_id must be non-empty bytes")
+            build_hex = bytes(build_id).hex()
+        else:
+            build_hex = secrets.token_hex(16)
+        self._begin_write()
+        try:
+            head = self._meta_int("head")
+            active = self.writer.execute(
+                f"SELECT instance_id, build_id FROM {SEC_INDEX_TABLE} "
+                "WHERE name = ? AND status IN ('building','ready')",
+                (decl.name,),
+            ).fetchone()
+            if active is not None:
+                raise IndexConflictError(
+                    f"an active secondary index named {decl.name!r} already "
+                    f"exists (instance {active[0]}, build "
+                    f"{bytes.fromhex(active[1]).hex()}); resume it with its "
+                    "build_id instead of registering again"
+                )
+            seq = self.writer.execute(
+                f"SELECT COALESCE(MAX(created_seq), 0) + 1 FROM {SEC_INDEX_TABLE}"
+            ).fetchone()[0]
+            instance_id = secrets.token_hex(16)
+            self.writer.execute(
+                f"INSERT INTO {SEC_INDEX_TABLE}"
+                "(instance_id, name, build_id, status, start_gen, "
+                "declaration_json, declaration_hash, next_seq, processed_seq, "
+                "baseline_cursor_key, baseline_cursor_rid, baseline_cursor_cgen, "
+                "baseline_done, ready_gen, created_seq) "
+                "VALUES (?, ?, ?, 'building', ?, ?, ?, 1, 0, NULL, NULL, NULL, "
+                "0, NULL, ?)",
+                (
+                    instance_id,
+                    decl.name,
+                    build_hex,
+                    head,
+                    decl.canonical_json().decode("utf-8"),
+                    decl.declaration_hash(),
+                    seq,
+                ),
+            )
+            self._commit()
+        except BaseException:
+            self._rollback()
+            raise
+        return {
+            "name": decl.name,
+            "instance_id": instance_id,
+            "build_id": {"__hex__": build_hex},
+            "build_id_hex": build_hex,
+            "start_gen": head,
+            "covered_from": head,
+            "status": BUILDING,
+            "declaration": decl.to_dict(),
+            "declaration_hash": decl.declaration_hash(),
+        }
+
+    def index_status(self, name: str) -> IndexBuildStatus:
+        row = self._index_row(name)
+        info = self._index_row_dict(row)
+        head = self._meta_int_reader("head")
+        entries = self.reader.execute(
+            f"SELECT COUNT(*) FROM {SEC_ENTRY_TABLE} WHERE instance_id = ?",
+            (info["instance_id"],),
+        ).fetchone()[0]
+        queued = self.reader.execute(
+            f"SELECT COUNT(*) FROM {SEC_QUEUE_TABLE} WHERE instance_id = ?",
+            (info["instance_id"],),
+        ).fetchone()[0]
+        return IndexBuildStatus(
+            name=info["name"],
+            instance_id=info["instance_id"],
+            build_id=info["build_id"],
+            status=info["status"],
+            start_gen=info["start_gen"],
+            declaration=json.loads(info["declaration_json"]),
+            declaration_hash=info["declaration_hash"],
+            head=head,
+            processed_seq=info["processed_seq"],
+            next_seq=info["next_seq"],
+            baseline_done=info["baseline_done"],
+            baseline_cursor_key=info["baseline_cursor_key"],
+            baseline_candidates_read=0,
+            catchup_changes_processed=0,
+            cumulative_baseline_candidates=info["baseline_candidates"],
+            cumulative_catchup_changes=info["catchup_changes"],
+            covered_from=info["start_gen"],
+            ready_gen=info["ready_gen"],
+            secondary_entries=entries,
+            queue_entries=queued,
+        )
+
+    def list_indexes(self, *, include_deleted: bool = False) -> list[IndexInfo]:
+        where = "" if include_deleted else (
+            " WHERE status IN ('building','ready')"
+        )
+        rows = self.reader.execute(
+            f"SELECT instance_id, name, build_id, status, start_gen, "
+            "declaration_json, declaration_hash, next_seq, processed_seq, "
+            "baseline_cursor_key, baseline_cursor_rid, baseline_cursor_cgen, "
+            "baseline_done, ready_gen, created_seq, baseline_candidates, "
+            "catchup_changes "
+            f"FROM {SEC_INDEX_TABLE}{where} ORDER BY created_seq"
+        ).fetchall()
+        out = []
+        for row in rows:
+            info = self._index_row_dict(row)
+            out.append(
+                IndexInfo(
+                    name=info["name"],
+                    instance_id=info["instance_id"],
+                    build_id=info["build_id"],
+                    status=info["status"],
+                    start_gen=info["start_gen"],
+                    declaration=json.loads(info["declaration_json"]),
+                    declaration_hash=info["declaration_hash"],
+                    ready_gen=info["ready_gen"],
+                    baseline_done=info["baseline_done"],
+                )
+            )
+        return out
+
+    def _load_instance(
+        self, name: str | None = None, instance_id: str | None = None,
+        *, require_building: bool = False, require_ready: bool = False,
+    ) -> dict:
+        row = (
+            self._index_row_by_instance(instance_id)
+            if instance_id is not None
+            else self._index_row(name)
+        )
+        if row is None:
+            raise IndexNotFoundError(
+                f"secondary index instance {instance_id!r} does not exist"
+            )
+        info = self._index_row_dict(row)
+        if require_building and info["status"] != BUILDING:
+            raise IndexConflictError(
+                f"index {info['name']!r} ({info['instance_id']}) is "
+                f"{info['status']}, not building"
+            )
+        if require_ready and info["status"] != READY:
+            raise IndexNotReadyError(
+                f"index {info['name']!r} is {info['status']}, not ready"
+            )
+        return info
+
+    def advance_index(
+        self,
+        name: str,
+        budget: int,
+        *,
+        expected_build_id: bytes | str | None = None,
+        crash_hook: Callable[[str, sqlite3.Connection], None] | None = None,
+    ) -> IndexBuildStatus:
+        """Perform at most ``budget`` units of index work, then commit.
+
+        Baseline candidate reads and catch-up journal rows each count as one
+        unit; a single call never processes more than ``budget`` combined.
+        All progress is written to disk inside one short transaction, so the
+        build can be resumed by another process and no write lock survives
+        the call.
+        """
+        if isinstance(budget, bool) or not isinstance(budget, int):
+            raise BatchError("budget must be an integer")
+        if budget < 0:
+            raise BatchError("budget must be >= 0")
+        if isinstance(expected_build_id, (bytes, bytearray)):
+            expected_build_id = bytes(expected_build_id).hex()
+        row = self._index_row(name)
+        info = self._index_row_dict(row)
+        if expected_build_id is not None and info["build_id"] != expected_build_id:
+            raise IndexConflictError(
+                f"build_id does not match the active build for {name!r} "
+                f"(expected {info['build_id']}, got {expected_build_id})"
+            )
+        if info["status"] == READY:
+            return self.index_status(name)
+        if info["status"] != BUILDING:
+            raise IndexConflictError(
+                f"index {name!r} is {info['status']} and cannot advance"
+            )
+
+        decl = resolve_declaration(self.schema, SecondaryDeclaration.from_json(
+            info["declaration_json"]
+        ))
+        start_gen = info["start_gen"]
+        this_baseline = 0
+        this_catchup = 0
+        baseline_done = info["baseline_done"]
+        cur_key = info["baseline_cursor_key"]
+        cur_rid = info["baseline_cursor_rid"]
+        cur_cgen = info["baseline_cursor_cgen"]
+        processed_seq = info["processed_seq"]
+        ready_gen: int | None = None
+
+        self._begin_write()
+        try:
+            # Re-read under the write lock (another process may have advanced).
+            fresh = self._index_row_dict(
+                self.writer.execute(
+                    f"SELECT instance_id, name, build_id, status, start_gen, "
+                    "declaration_json, declaration_hash, next_seq, processed_seq, "
+                    "baseline_cursor_key, baseline_cursor_rid, baseline_cursor_cgen, "
+                    "baseline_done, ready_gen, created_seq, baseline_candidates, "
+                    "catchup_changes "
+                    f"FROM {SEC_INDEX_TABLE} WHERE instance_id = ?",
+                    (info["instance_id"],),
+                ).fetchone()
+            )
+            if fresh["status"] != BUILDING:
+                if fresh["status"] == READY:
+                    self._commit()
+                    return self.index_status(name)
+                raise IndexConflictError(
+                    f"index {name!r} changed to {fresh['status']} concurrently"
+                )
+            baseline_done = fresh["baseline_done"]
+            cur_key = fresh["baseline_cursor_key"]
+            cur_rid = fresh["baseline_cursor_rid"]
+            cur_cgen = fresh["baseline_cursor_cgen"]
+            processed_seq = fresh["processed_seq"]
+
+            remaining = budget
+            # ---- Phase 1: baseline candidates from the main store ----
+            # Candidates are exactly the versions that can be visible in some
+            # generation >= B: created at or before B and not already dead at
+            # B.  A later apply only ever closes such a version with
+            # dgen > B, so the candidate set is stable under concurrent
+            # publication and keyset pagination cannot skip a row that moved
+            # from live to dead mid-build.  Versions created after B are
+            # covered by the catch-up journal instead.
+            while not baseline_done and remaining > 0:
+                sql = (
+                    f"SELECT key, rid, cgen, dgen FROM {KV_TABLE} "
+                    "WHERE cgen <= ? AND (dgen IS NULL OR dgen > ?)"
+                )
+                params: list = [start_gen, start_gen]
+                if cur_key is not None:
+                    sql += " AND (key, rid, cgen) > (?, ?, ?)"
+                    params.extend([cur_key, cur_rid, cur_cgen])
+                sql += " ORDER BY key, rid, cgen LIMIT ?"
+                params.append(remaining)
+                batch = self.writer.execute(sql, params).fetchall()
+                if not batch:
+                    baseline_done = True
+                    break
+                for key, rid, cgen, _dgen in batch:
+                    values, decoded_rid = key_decode(self.schema, key)
+                    if decoded_rid != rid:
+                        raise CollectionError(
+                            f"stored key/row_id pair is inconsistent for {rid.hex()}"
+                        )
+                    self._insert_index_entry(
+                        info["instance_id"], decl, key, rid, values, cgen
+                    )
+                    cur_key, cur_rid, cur_cgen = key, rid, cgen
+                    this_baseline += 1
+                    remaining -= 1
+                if remaining <= 0:
+                    break
+
+            # ---- Phase 2: catch-up journal (ordered by apply publication) ----
+            if baseline_done and remaining > 0:
+                qsql = (
+                    f"SELECT seq, kind, index_key, rid, cgen, main_key, close_gen "
+                    f"FROM {SEC_QUEUE_TABLE} WHERE instance_id = ? AND seq > ? "
+                    "ORDER BY seq LIMIT ?"
+                )
+                rows = self.writer.execute(
+                    qsql, (info["instance_id"], processed_seq, remaining)
+                ).fetchall()
+                for seq, kind, index_key, rid, cgen, main_key, close_gen in rows:
+                    if kind == "open":
+                        # A version opening at cgen > B can never coincide with
+                        # a baseline entry (which only covers cgen <= B) or with
+                        # another open, so a conflict would be a real bug and
+                        # must surface rather than be silently ignored.
+                        self.writer.execute(
+                            f"INSERT INTO {SEC_ENTRY_TABLE}"
+                            "(instance_id, index_key, cgen, dgen, rid, main_key, "
+                            "main_cgen) VALUES (?, ?, ?, NULL, ?, ?, ?)",
+                            (info["instance_id"], index_key, cgen, rid, main_key,
+                             cgen),
+                        )
+                    else:  # close
+                        self.writer.execute(
+                            f"UPDATE {SEC_ENTRY_TABLE} SET dgen = ? "
+                            "WHERE instance_id = ? AND index_key = ? "
+                            "AND cgen = ? AND dgen IS NULL",
+                            (close_gen, info["instance_id"], index_key, cgen),
+                        )
+                    processed_seq = seq
+                    this_catchup += 1
+                    remaining -= 1
+
+            # ---- Phase 3: commit the switch when everything is covered ----
+            # The journal's next_seq is only bumped by applies; anything with
+            # seq < next_seq is durable input.  processed_seq >= next_seq - 1
+            # means every such event has been folded in below this write lock.
+            final_head = self._meta_int("head")
+            current_next = self.writer.execute(
+                f"SELECT next_seq FROM {SEC_INDEX_TABLE} WHERE instance_id = ?",
+                (info["instance_id"],),
+            ).fetchone()[0]
+            if baseline_done and processed_seq >= current_next - 1:
+                # Every version created at or after B is present, and every
+                # later change has been folded in.  The explicit switch.
+                ready_gen = final_head
+                self.writer.execute(
+                    f"UPDATE {SEC_INDEX_TABLE} SET status = 'ready', "
+                    "baseline_cursor_key = NULL, baseline_cursor_rid = NULL, "
+                    "baseline_cursor_cgen = NULL, baseline_done = 1, "
+                    "ready_gen = ?, processed_seq = ?, "
+                    "baseline_candidates = baseline_candidates + ?, "
+                    "catchup_changes = catchup_changes + ? "
+                    "WHERE instance_id = ?",
+                    (ready_gen, processed_seq, this_baseline, this_catchup,
+                     info["instance_id"]),
+                )
+                self.writer.execute(
+                    f"DELETE FROM {SEC_QUEUE_TABLE} WHERE instance_id = ?",
+                    (info["instance_id"],),
+                )
+            else:
+                self.writer.execute(
+                    f"UPDATE {SEC_INDEX_TABLE} SET baseline_cursor_key = ?, "
+                    "baseline_cursor_rid = ?, baseline_cursor_cgen = ?, "
+                    "baseline_done = ?, processed_seq = ?, "
+                    "baseline_candidates = baseline_candidates + ?, "
+                    "catchup_changes = catchup_changes + ? "
+                    "WHERE instance_id = ?",
+                    (
+                        cur_key if not baseline_done else None,
+                        cur_rid if not baseline_done else None,
+                        cur_cgen if not baseline_done else None,
+                        1 if baseline_done else 0,
+                        processed_seq,
+                        this_baseline,
+                        this_catchup,
+                        info["instance_id"],
+                    ),
+                )
+            if crash_hook is not None:
+                crash_hook("pre_commit", self.writer)
+            self._commit()
+            if crash_hook is not None:
+                crash_hook("post_commit", self.writer)
+        except BaseException:
+            self._rollback()
+            raise
+
+        status = self.index_status(name)
+        status.baseline_candidates_read = this_baseline
+        status.catchup_changes_processed = this_catchup
+        return status
+
+    def _insert_index_entry(
+        self, instance_id: str, decl: SecondaryDeclaration,
+        main_key: bytes, rid: bytes, values: tuple, cgen: int,
+    ) -> None:
+        index_key = encode_index_key(self.schema, decl, values, rid)
+        # The baseline keyset visits each (key, rid, cgen) at most once, so a
+        # primary-key conflict here would mean a pagination bug; do not mask
+        # it with INSERT OR IGNORE.
+        self.writer.execute(
+            f"INSERT INTO {SEC_ENTRY_TABLE}"
+            "(instance_id, index_key, cgen, dgen, rid, main_key, main_cgen) "
+            "VALUES (?, ?, ?, NULL, ?, ?, ?)",
+            (instance_id, index_key, cgen, rid, main_key, cgen),
+        )
+
+    def cancel_index(self, name: str) -> dict:
+        """Cancel a building index, releasing only its build-only material."""
+        self._begin_write()
+        try:
+            row = self.writer.execute(
+                f"SELECT instance_id, status, start_gen FROM {SEC_INDEX_TABLE} "
+                "WHERE name = ? AND status IN ('building','ready')",
+                (name,),
+            ).fetchone()
+            if row is None:
+                raise IndexNotFoundError(f"no live secondary index named {name!r}")
+            iid, status, start_gen = row
+            if status == READY:
+                raise IndexConflictError(
+                    f"index {name!r} is ready; use delete_index to retire it"
+                )
+            entries = self.writer.execute(
+                f"DELETE FROM {SEC_ENTRY_TABLE} WHERE instance_id = ?", (iid,)
+            ).rowcount
+            queued = self.writer.execute(
+                f"DELETE FROM {SEC_QUEUE_TABLE} WHERE instance_id = ?", (iid,)
+            ).rowcount
+            self.writer.execute(
+                f"UPDATE {SEC_INDEX_TABLE} SET status = 'cancelled' "
+                "WHERE instance_id = ?",
+                (iid,),
+            )
+            self._commit()
+        except BaseException:
+            self._rollback()
+            raise
+        return {
+            "cancelled": name,
+            "instance_id": iid,
+            "start_gen": start_gen,
+            "secondary_entries_removed": entries,
+            "queue_entries_removed": queued,
+        }
+
+    def delete_index(self, name: str, *, instance_id: str | None = None) -> dict:
+        """Retire a named index instance immediately.
+
+        The instance can no longer advance or page; the name is free for a
+        *different* declaration.  Old cursors keep their old instance id and
+        are rejected.  Neither the main store, other builds, receipts nor
+        snapshots are touched.
+        """
+        self._begin_write()
+        try:
+            row = self.writer.execute(
+                f"SELECT instance_id, status, start_gen FROM {SEC_INDEX_TABLE} "
+                "WHERE name = ? AND status IN ('building','ready')",
+                (name,),
+            ).fetchone()
+            if row is None:
+                raise IndexNotFoundError(f"no live secondary index named {name!r}")
+            iid, status, start_gen = row
+            if instance_id is not None and instance_id != iid:
+                raise IndexConflictError(
+                    f"index name {name!r} now refers to a different instance "
+                    f"({iid}); the supplied identity {instance_id} is stale"
+                )
+            entries = self.writer.execute(
+                f"DELETE FROM {SEC_ENTRY_TABLE} WHERE instance_id = ?", (iid,)
+            ).rowcount
+            queued = self.writer.execute(
+                f"DELETE FROM {SEC_QUEUE_TABLE} WHERE instance_id = ?", (iid,)
+            ).rowcount
+            self.writer.execute(
+                f"UPDATE {SEC_INDEX_TABLE} SET status = 'deleted' "
+                "WHERE instance_id = ?",
+                (iid,),
+            )
+            self._commit()
+        except BaseException:
+            self._rollback()
+            raise
+        return {
+            "deleted": name,
+            "instance_id": iid,
+            "previous_status": status,
+            "start_gen": start_gen,
+            "secondary_entries_removed": entries,
+            "queue_entries_removed": queued,
+        }
+
 
     def _resolve_snapshot(self, token: str) -> SnapshotTicket:
         ticket = decode_snapshot_token(token, self.secret)
@@ -1071,6 +1974,291 @@ class Collection:
                 return
             cursor_token = page.next_cursor
 
+    # -- secondary-index snapshot scans -----------------------------------
+
+    def _index_scan_sql(
+        self, instance_id: str, interval: Interval,
+        after: tuple[bytes, bytes, int] | None,
+    ) -> tuple[str, list]:
+        # ``index_key`` ends with the ascending row_id component, so within a
+        # single index_key the rid is constant and there is exactly one rid.
+        # Ordering/seek on (index_key, cgen) is therefore the same total order
+        # as (index_key, rid, cgen) and matches the primary-key prefix
+        # (instance_id, index_key, cgen): SQLite streams the seek in key order
+        # with no temp sort and no full-range materialization.
+        clauses = ["instance_id = ?"]
+        params: list = [instance_id]
+        if interval.lower is not None:
+            clauses.append("index_key >= ?")
+            params.append(interval.lower)
+        if interval.upper is not None:
+            clauses.append("index_key < ?")
+            params.append(interval.upper)
+        if after is not None:
+            clauses.append("(index_key, cgen) > (?, ?)")
+            params.extend([after[0], after[2]])
+        sql = (
+            f"SELECT index_key, cgen, dgen, rid, main_key, main_cgen "
+            f"FROM {SEC_ENTRY_TABLE} WHERE " + " AND ".join(clauses) +
+            " ORDER BY index_key ASC, cgen ASC"
+        )
+        return sql, params
+
+    def _resolve_ready_index(self, name: str) -> dict:
+        info = self._load_instance(name=name, require_ready=False)
+        if info["status"] == BUILDING:
+            raise IndexNotReadyError(
+                f"index {name!r} is still building; it cannot serve reads "
+                "before its ready switch commits"
+            )
+        if info["status"] != READY:
+            raise IndexNotFoundError(f"no live secondary index named {name!r}")
+        return info
+
+    def scan_index_page(
+        self,
+        snapshot_token: str,
+        index_name: str,
+        query: Mapping[str, Any],
+        page_size: int,
+        *,
+        cursor_token: str | None = None,
+    ) -> tuple[IndexPage, IndexScanStats, QueryPlan]:
+        """Read one page of the *full* collection records through an index.
+
+        The snapshot token still selects the read generation; the index only
+        supplies a different access order.  The token's generation must be at
+        least the index's coverage start B -- an older token is refused
+        instead of silently falling back to a main-table scan.  Every returned
+        record is the complete main-schema tuple and original row_id.
+        """
+        if isinstance(page_size, bool) or not isinstance(page_size, int) or page_size <= 0:
+            raise TokenError("page_size must be a positive integer")
+        ticket = self._resolve_snapshot(snapshot_token)
+        info = self._resolve_ready_index(index_name)
+        decl = resolve_declaration(
+            self.schema, SecondaryDeclaration.from_json(info["declaration_json"])
+        )
+        if ticket.gen < info["start_gen"]:
+            raise CoverageError(
+                f"snapshot generation {ticket.gen} is older than index "
+                f"{index_name!r}'s coverage start {info['start_gen']}; this "
+                "index cannot answer that generation (a main-table scan is "
+                "not substituted)"
+            )
+        validate_query_columns(self.schema, decl, query)
+        plan = plan_index_query(self.schema, decl, query)
+
+        after: tuple[bytes, bytes, int] | None = None
+        if cursor_token is not None:
+            cursor = decode_secondary_cursor(cursor_token, self.secret)
+            if cursor.collection_id != self.collection_id:
+                raise IndexCursorError("cursor belongs to a different collection")
+            if cursor.db_path != self.path:
+                raise IndexCursorError(
+                    "cursor was created against a different file path"
+                )
+            if cursor.sid != ticket.sid:
+                raise IndexCursorError(
+                    "cursor belongs to a different snapshot token"
+                )
+            if cursor.gen != ticket.gen:
+                raise IndexCursorError("cursor generation does not match snapshot")
+            if cursor.index_name != index_name:
+                raise IndexCursorError(
+                    f"cursor belongs to index {cursor.index_name!r}, not "
+                    f"{index_name!r}"
+                )
+            if cursor.instance_id != info["instance_id"]:
+                raise IndexCursorError(
+                    "cursor belongs to a different index instance "
+                    "(a same-name rebuild cannot continue it)"
+                )
+            if cursor.declaration_hash != info["declaration_hash"]:
+                raise IndexCursorError(
+                    "cursor declaration does not match the index declaration"
+                )
+            if cursor.query_spec != plan.query_spec:
+                raise IndexCursorError(
+                    "cursor query specification does not match current query"
+                )
+            if cursor.page_size != page_size:
+                raise IndexCursorError(
+                    f"cursor page_size is {cursor.page_size}, but {page_size} "
+                    "was requested"
+                )
+            after = (cursor.last_index_key, cursor.last_rid, cursor.last_cgen)
+
+        eqp: list[dict] = []
+        used_index = True
+        if plan.intervals:
+            sql0, params0 = self._index_scan_sql(
+                info["instance_id"], plan.intervals[0], after
+            )
+            eqp = [
+                {"id": r[0], "parent": r[1], "notused": r[2], "detail": r[3]}
+                for r in self.reader.execute(
+                    "EXPLAIN QUERY PLAN " + sql0, params0
+                ).fetchall()
+            ]
+            used_index = any(
+                "USING PRIMARY KEY" in r["detail"] or "USING INDEX" in r["detail"]
+                for r in eqp
+            )
+
+        g = ticket.gen
+        candidates = 0
+        invisible = 0
+        lookups = 0
+        delivered: list[tuple] = []
+        if plan.intervals:
+            for interval in plan.intervals:
+                if len(delivered) > page_size:
+                    break
+                sql, params = self._index_scan_sql(
+                    info["instance_id"], interval, after
+                )
+                # One streaming storage cursor over the index key range.  At
+                # most page_size + 1 visible entries are retained, so memory
+                # is bounded by the page, not the range or the table.
+                for index_key, cgen, dgen, rid, main_key, main_cgen in \
+                        self.reader.execute(sql, params):
+                    candidates += 1
+                    visible = not (
+                        cgen > g or (dgen is not None and dgen <= g)
+                    )
+                    if not visible:
+                        invisible += 1
+                        continue
+                    # Locate the exact main version (key, rid, cgen), never a
+                    # current live row in its place.  This is a primary-key
+                    # seek on the main table, one per delivered candidate.
+                    lookups += 1
+                    main = self.reader.execute(
+                        f"SELECT 1 FROM {KV_TABLE} WHERE key = ? AND rid = ? "
+                        "AND cgen = ?",
+                        (main_key, rid, main_cgen),
+                    ).fetchone()
+                    if main is None:
+                        raise CollectionError(
+                            "secondary index points at a missing main version"
+                        )
+                    values, decoded_rid = key_decode(self.schema, main_key)
+                    if decoded_rid != rid:
+                        raise CollectionError(
+                            f"stored key/row_id pair is inconsistent for "
+                            f"{rid.hex()}"
+                        )
+                    delivered.append((index_key, cgen, rid, main_key, values))
+                    if len(delivered) > page_size:
+                        break
+                if len(delivered) > page_size:
+                    break
+
+        page_rows = delivered[:page_size]
+        has_more = len(delivered) > page_size
+        next_cursor = None
+        if has_more and page_rows:
+            last = page_rows[-1]
+            next_cursor = encode_secondary_cursor(
+                secret=self.secret,
+                collection_id=self.collection_id,
+                sid=ticket.sid,
+                gen=ticket.gen,
+                query_spec=plan.query_spec,
+                page_size=page_size,
+                index_name=index_name,
+                instance_id=info["instance_id"],
+                declaration_hash=info["declaration_hash"],
+                last_index_key=last[0],
+                last_rid=last[2],
+                last_cgen=last[1],
+                db_path=self.path,
+            )
+        stats = IndexScanStats(
+            index_candidates_examined=candidates,
+            invisible_versions_skipped=invisible,
+            full_row_lookups=lookups,
+            rows_delivered=len(page_rows),
+            has_more=has_more,
+            used_index=used_index,
+            explain_query_plan=eqp,
+            intervals=[
+                {
+                    "lower_hex": i.lower.hex() if i.lower is not None else None,
+                    "upper_hex": i.upper.hex() if i.upper is not None else None,
+                }
+                for i in plan.intervals
+            ],
+        )
+        page = IndexPage(
+            rows=[(row[4], row[2]) for row in page_rows],
+            next_cursor=next_cursor,
+            last_index_key=page_rows[-1][0] if page_rows else None,
+            gen=ticket.gen,
+            sid=ticket.sid,
+            index_name=index_name,
+            instance_id=info["instance_id"],
+        )
+        return page, stats, plan
+
+    def iter_index(
+        self,
+        snapshot_token: str,
+        index_name: str,
+        query: Mapping[str, Any],
+        page_size: int,
+    ) -> Iterable[tuple[tuple, bytes]]:
+        cursor_token: str | None = None
+        while True:
+            page, _stats, _plan = self.scan_index_page(
+                snapshot_token, index_name, query, page_size,
+                cursor_token=cursor_token,
+            )
+            for item in page.rows:
+                yield item
+            if page.next_cursor is None:
+                return
+            cursor_token = page.next_cursor
+
+    def explain_index_scan(
+        self,
+        index_name: str,
+        query: Mapping[str, Any],
+        page_size: int = 100,
+    ) -> dict:
+        """Plan evidence for the secondary path without reading any rows."""
+        info = self._resolve_ready_index(index_name)
+        decl = resolve_declaration(
+            self.schema, SecondaryDeclaration.from_json(info["declaration_json"])
+        )
+        validate_query_columns(self.schema, decl, query)
+        plan = plan_index_query(self.schema, decl, query)
+        eqp: list[dict] = []
+        if plan.intervals:
+            sql0, params0 = self._index_scan_sql(
+                info["instance_id"], plan.intervals[0], None
+            )
+            eqp = [
+                {"id": r[0], "parent": r[1], "notused": r[2], "detail": r[3]}
+                for r in self.reader.execute(
+                    "EXPLAIN QUERY PLAN " + sql0, params0
+                ).fetchall()
+            ]
+        return {
+            "index": info["name"],
+            "instance_id": info["instance_id"],
+            "declaration": json.loads(info["declaration_json"]),
+            "covered_from": info["start_gen"],
+            "ready_gen": info["ready_gen"],
+            "plan": plan.explain(),
+            "explain_query_plan": eqp,
+            "entry_table_seek": bool(eqp) and any(
+                "USING PRIMARY KEY" in d["detail"] for d in eqp
+            ),
+            "page_size": page_size,
+        }
+
     # -- history collection ------------------------------------------------
 
     def collect_history(self, retain_from: int) -> HistoryStats:
@@ -1098,7 +2286,13 @@ class Collection:
                 )
             # An entry is reclaimable exactly when it is already dead at the
             # new boundary AND no active snapshot's generation lies inside its
-            # visibility window [cgen, dgen).
+            # visibility window [cgen, dgen).  In addition, a *building*
+            # secondary index protects its own baseline candidates in the main
+            # store: those versions are inputs to a future advance, and the
+            # user must not have to keep an extra snapshot alive for the
+            # build.  Once the build is ready or cancelled the protection
+            # disappears (ready indexes only ever need versions an active
+            # snapshot can still read, exactly like the main store).
             cur = self.writer.execute(
                 f"DELETE FROM {KV_TABLE} "
                 "WHERE dgen IS NOT NULL AND dgen <= ? "
@@ -1106,10 +2300,45 @@ class Collection:
                 f"  SELECT 1 FROM {SNAPSHOT_TABLE} s "
                 "  WHERE s.status = 'active' AND s.gen >= bytekey_kv.cgen "
                 "  AND s.gen < bytekey_kv.dgen)"
-                ,
+                " AND NOT EXISTS ("
+                f"  SELECT 1 FROM {SEC_INDEX_TABLE} i "
+                "  WHERE i.status = 'building' "
+                "  AND bytekey_kv.cgen <= i.start_gen "
+                "  AND bytekey_kv.dgen > i.start_gen)",
                 (retain_from,),
             )
             removed = cur.rowcount
+            # Secondary history items obey the same rule, per instance.  A
+            # *building* index protects its own material: its baseline
+            # candidates and any on-disk journal rows are inputs to a future
+            # advance, so history collection must not consume them while the
+            # build is in flight.  (Ready indexes keep dead versions only as
+            # long as an active snapshot can see them, exactly like main.)
+            sec_removed = self.writer.execute(
+                f"DELETE FROM {SEC_ENTRY_TABLE} "
+                "WHERE dgen IS NOT NULL AND dgen <= ? "
+                "AND NOT EXISTS ("
+                f"  SELECT 1 FROM {SNAPSHOT_TABLE} s "
+                "  WHERE s.status = 'active' AND s.gen >= bytekey_sec_entries.cgen "
+                "  AND s.gen < bytekey_sec_entries.dgen)"
+                " AND NOT EXISTS ("
+                f"  SELECT 1 FROM {SEC_INDEX_TABLE} i "
+                "  WHERE i.instance_id = bytekey_sec_entries.instance_id "
+                "  AND i.status = 'building')",
+                (retain_from,),
+            ).rowcount
+            # Journal rows belong exclusively to a *building* instance; they
+            # are build-only protected input and are released when the build
+            # commits ready (or is cancelled/deleted).  A live build keeps all
+            # of its journal even if retention moved past it.  Any journal row
+            # whose instance is no longer building is stale and removable.
+            queue_removed = self.writer.execute(
+                f"DELETE FROM {SEC_QUEUE_TABLE} "
+                "WHERE NOT EXISTS ("
+                f"  SELECT 1 FROM {SEC_INDEX_TABLE} i "
+                "  WHERE i.instance_id = bytekey_sec_queue.instance_id "
+                "  AND i.status = 'building')"
+            ).rowcount
             self._set_meta("retain_from", retain_from)
             active = self.writer.execute(
                 f"SELECT COUNT(*) FROM {SNAPSHOT_TABLE} WHERE status = 'active'"
@@ -1124,6 +2353,8 @@ class Collection:
             entries_removed=removed,
             active_snapshots=active,
             head=head,
+            secondary_entries_removed=sec_removed,
+            queue_entries_removed=queue_removed,
         )
 
     # -- status ------------------------------------------------------------
@@ -1146,6 +2377,21 @@ class Collection:
             ).fetchall()
         ]
         active = [s for s in snaps if s["status"] == "active"]
+        indexes = [
+            {
+                "name": i.name,
+                "instance_id": i.instance_id,
+                "build_id": i.build_id,
+                "status": i.status,
+                "start_gen": i.start_gen,
+                "covered_from": i.start_gen,
+                "ready_gen": i.ready_gen,
+                "declaration": i.declaration,
+                "declaration_hash": i.declaration_hash,
+                "baseline_done": i.baseline_done,
+            }
+            for i in self.list_indexes(include_deleted=False)
+        ]
         return CollectionStatus(
             path=self.path,
             collection_id=self.collection_id,
@@ -1158,6 +2404,7 @@ class Collection:
             dead_entries=total - live,
             receipt_count=receipts,
             active_snapshots=active,
+            indexes=indexes,
         )
 
     def _meta_int_reader(self, name: str) -> int:

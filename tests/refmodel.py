@@ -197,3 +197,206 @@ def drain_snapshot(coll, token: str, query: dict, page_size: int):
         if page.next_cursor is None:
             return out, pages, plan
         cursor = page.next_cursor
+
+
+# ---------------------------------------------------------------------------
+# Secondary-index reference helpers (independent of production planning)
+# ---------------------------------------------------------------------------
+
+def index_projection(schema, declaration):
+    """Projected (declared-order) tuples for a full main-schema tuple.
+
+    Only ordering flags are taken from the declaration; the column *kind* and
+    the values always come from the main schema.  No encoder is involved.
+    """
+    pos = {c.name: i for i, c in enumerate(schema.columns)}
+    out = []
+    for item in declaration["columns"]:
+        out.append(_ProjectedValue(
+            pos[item["name"]], item["asc"], item["nulls_first"]
+        ))
+    return out
+
+
+class _ProjectedValue:
+    def __init__(self, index, asc, nulls_first):
+        self.index = index
+        self.asc = asc
+        self.nulls_first = nulls_first
+
+
+def _projected_order_key(schema, declaration, values, row_id):
+    """Sort key over plain Python values, implementing the declaration order."""
+    key = []
+    for item in declaration["columns"]:
+        col = schema.column(item["name"])
+        v = values[schema.columns.index(col)]
+        key.append(_column_sort_key(item, v))
+    key.append(row_id)  # final ascending row_id tie-break
+    return tuple(key)
+
+
+def _column_sort_key(item, value):
+    nulls_first = item.get("nulls_first", True)
+    asc = item.get("asc", True)
+    # Encode placement then ascending/descending comparison without the
+    # production encoder: (is_null_rank, value_rank, value_negated_for_desc).
+    if value is None:
+        return (0 if nulls_first else 2, 0)
+    if isinstance(value, bool):
+        vkey = 1 if value else 0
+    elif isinstance(value, (int, float)):
+        vkey = value
+    elif isinstance(value, str):
+        vkey = value
+    elif isinstance(value, (bytes, bytearray)):
+        vkey = bytes(value)
+    else:
+        raise AssertionError(type(value))
+    return (1, vkey if asc else _Descending(vkey))
+
+
+class _Descending:
+    """Wrapper reversing comparison only (values never compared across kinds)."""
+
+    __slots__ = ("v",)
+
+    def __init__(self, v):
+        self.v = v
+
+    def __eq__(self, other):
+        return isinstance(other, _Descending) and self.v == other.v
+
+    def __lt__(self, other):
+        return self.v > other.v
+
+    def __gt__(self, other):
+        return self.v < other.v
+
+    def __le__(self, other):
+        return self.v >= other.v
+
+    def __ge__(self, other):
+        return self.v <= other.v
+
+    def __repr__(self):
+        return f"D({self.v!r})"
+
+
+def expected_index_order(schema, declaration, records):
+    """Order full (values, rid) records by the declaration, independent code."""
+    import functools
+
+    def cmp(a, b):
+        ka = _projected_order_key(schema, declaration, a[0], a[1])
+        kb = _projected_order_key(schema, declaration, b[0], b[1])
+        if ka < kb:
+            return -1
+        if ka > kb:
+            return 1
+        return 0
+
+    return sorted(records, key=functools.cmp_to_key(cmp))
+
+
+def matches_index_query(schema, declaration, values, row_id, query):
+    """Reference filter: evaluate a query against the declaration's order.
+
+    ``full_tuple`` bounds are positional in the declaration order and exclude
+    row_id; ``prefix_range`` names columns explicitly.  Values outside the
+    declared projection are irrelevant, but the returned record is full.
+    """
+    names = [item["name"] for item in declaration["columns"]]
+    projected = [values[schema.columns.index(schema.column(n))] for n in names]
+    flags = declaration["columns"]
+    if query["shape"] == "full_tuple":
+        lower = query.get("lower")
+        upper = query.get("upper")
+        if lower is not None:
+            c = _cmp_projected(flags, projected, lower)
+            if c < 0 or (c == 0 and not query.get("lower_inclusive", True)):
+                return False
+        if upper is not None:
+            c = _cmp_projected(flags, projected, upper)
+            if c > 0 or (c == 0 and not query.get("upper_inclusive", True)):
+                return False
+        return True
+    if query["shape"] == "prefix_range":
+        prefix = query.get("prefix", []) or []
+        for i, (name, want) in enumerate(prefix):
+            if name not in names or names[i] != name:
+                # The planner requires prefix entries to line up with the
+                # declaration order; the reference model enforces that too.
+                return False
+            if not _same_scalar(projected[i], want):
+                return False
+        k = len(prefix)
+        if k >= len(names):
+            return False
+        range_name = query.get("range_column")
+        if range_name is not None and range_name != names[k]:
+            return False
+        v = projected[k]
+        if v is None:  # range column excludes null
+            return False
+        lo = query.get("lo")
+        hi = query.get("hi")
+        if lo is not None:
+            if v < lo or (v == lo and not query.get("lo_inclusive", True)):
+                return False
+        if hi is not None:
+            if v > hi or (v == hi and not query.get("hi_inclusive", True)):
+                return False
+        return True
+    raise AssertionError(query["shape"])
+
+
+def _cmp_projected(flags, values, bound):
+    for flag, va, vb in zip(flags, values, bound):
+        c = _cmp_one(flag, va, vb)
+        if c != 0:
+            return c
+    return 0
+
+
+def _cmp_one(flag, a, b):
+    if a is None and b is None:
+        return 0
+    if a is None:
+        return -1 if flag.get("nulls_first", True) else 1
+    if b is None:
+        return 1 if flag.get("nulls_first", True) else -1
+    c = -1 if a < b else (1 if a > b else 0)
+    return c if flag.get("asc", True) else -c
+
+
+def _same_scalar(a, b):
+    if a is None or b is None:
+        return a is None and b is None
+    return type(a) is type(b) and a == b
+
+
+def query_index_at(ref, gen: int, declaration: dict, query: dict):
+    """Full records at ``gen`` matching ``query`` in declaration order."""
+    records = expected_index_order(ref.schema, declaration, ref.records_at(gen))
+    return [
+        rec for rec in records
+        if matches_index_query(ref.schema, declaration, rec[0], rec[1], query)
+    ]
+
+
+def drain_index(coll, token: str, index_name: str, query: dict, page_size: int):
+    """Page through a production ready index exactly as a client would."""
+    out = []
+    cursor = None
+    pages = 0
+    while True:
+        page, stats, plan = coll.scan_index_page(
+            token, index_name, query, page_size, cursor_token=cursor
+        )
+        out.extend(page.rows)
+        pages += 1
+        if page.next_cursor is None:
+            return out, pages, plan
+        cursor = page.next_cursor
+

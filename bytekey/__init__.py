@@ -10,6 +10,8 @@ Public API:
     create_collection, open_collection, import_from_index, Collection
     ApplyReceipt, SnapshotPage, SnapshotScanStats, HistoryStats, CollectionStatus
     TokenError, CollectionError, BatchError, ConflictError, HistoryError
+    SecondaryDeclaration, IndexColumn, IndexPage, IndexScanStats,
+    IndexBuildStatus, IndexInfo, CoverageError, IndexCursorError
 """
 from .schema import Schema, Column
 from .encoding import (
@@ -41,10 +43,33 @@ from .snapshot import (
     TokenError,
     SnapshotTicket,
     CollectionCursor,
+    SecondaryCursor,
     encode_snapshot_token,
     decode_snapshot_token,
     encode_collection_cursor,
     decode_collection_cursor,
+    encode_secondary_cursor,
+    decode_secondary_cursor,
+)
+from .secondary import (
+    BUILDING,
+    READY,
+    CANCELLED,
+    DELETED,
+    IndexColumn,
+    SecondaryDeclaration,
+    SecondaryError,
+    IndexDeclarationError,
+    IndexNotFoundError,
+    IndexNotReadyError,
+    IndexConflictError,
+    IndexCursorError,
+    CoverageError,
+    BuildCancelledError,
+    index_schema,
+    index_columns,
+    encode_index_key,
+    plan_index_query,
 )
 from .collection import (
     Collection,
@@ -53,6 +78,10 @@ from .collection import (
     SnapshotScanStats,
     HistoryStats,
     CollectionStatus,
+    IndexPage,
+    IndexScanStats,
+    IndexBuildStatus,
+    IndexInfo,
     CollectionError,
     BatchError,
     ConflictError,
@@ -107,4 +136,30 @@ __all__ = [
     "decode_snapshot_token",
     "encode_collection_cursor",
     "decode_collection_cursor",
+    # Named secondary access indexes
+    "IndexPage",
+    "IndexScanStats",
+    "IndexBuildStatus",
+    "IndexInfo",
+    "SecondaryCursor",
+    "encode_secondary_cursor",
+    "decode_secondary_cursor",
+    "IndexColumn",
+    "SecondaryDeclaration",
+    "SecondaryError",
+    "IndexDeclarationError",
+    "IndexNotFoundError",
+    "IndexNotReadyError",
+    "IndexConflictError",
+    "IndexCursorError",
+    "CoverageError",
+    "BuildCancelledError",
+    "BUILDING",
+    "READY",
+    "CANCELLED",
+    "DELETED",
+    "index_schema",
+    "index_columns",
+    "encode_index_key",
+    "plan_index_query",
 ]

@@ -5,6 +5,12 @@ stored in a SQLite `WITHOUT ROWID` primary-key table, then compiles business
 range queries into concrete byte scan intervals.  It is built for stable,
 keyset (seek) pagination over warehouse-style composite keys.
 
+Two layers build on the static index: an **updatable collection** with durable
+multi-generation read snapshots (below), and, on top of it, **named secondary
+access indexes** that serve the same full records in a second user-chosen
+order without touching the main ordering.  SQLite is the only store; no
+external service is required.
+
 ## What it guarantees
 
 * **Order-preserving, reversible, collision-free encoding.**  SQLite's BLOB
@@ -340,4 +346,237 @@ python3 -I tests/test_collection_random.py     # randomized differential vs orac
 python3 -I tests/test_collection_large.py      # bounded work, range scans, reclamation
 python3 -I tests/test_collection_cli.py        # full CLI lifecycle and failure exits
 ```
+
+---
+
+# Named secondary access indexes
+
+A collection's primary ordering is fixed by its schema. When a second workload
+needs the same records by a different order (say *time window first, then
+region*), you can register a **named secondary access index** over a chosen
+subset of the collection's *existing* business columns. It is a real ordered
+storage path, not a cached Python sort:
+
+* the key is the unchanged reversible `bytekey` encoding of the projected
+  columns, each with its own `asc` / `nulls_first`, terminated by the original
+  `row_id` ascending. The column *type* is inherited from the main schema and
+  no new business column or expression is introduced;
+* equal indexed business values for different identities stay distinct keys
+  (the row_id is part of the key), so the business projection is never made
+  unique;
+* the ready index is maintained by every later `apply` in the *same commit* as
+  the main version, head and receipt, so it always reflects the whole
+  generation history, not just a snapshot taken at the ready switch.
+
+The two existing query shapes are reused. A query is interpreted in the
+*index declaration's* column order; the returned `values` are always the
+**full main-schema tuple** (all columns) plus the original `row_id` -- never a
+projection of just the sorted columns.
+
+## Declaration
+
+```json
+{"name": "ts_region",
+ "columns": [{"name": "ts", "asc": false, "nulls_first": true},
+             {"name": "region", "asc": true, "nulls_first": true}]}
+```
+
+Each column must already exist in the collection schema and may appear at most
+once; `name` must be non-empty. A duplicate among *active* names fails
+explicitly and hands back the existing `build_id` to resume instead.
+
+## Lifecycle: register, advance, ready
+
+```python
+from bytekey import SecondaryDeclaration, IndexColumn, open_collection
+
+coll = open_collection("warehouse.db")
+reg = coll.register_index("ts_region", columns=[...])   # or a declaration object
+# reg -> {"instance_id", "build_id", "start_gen" (B), "status": "building"}
+
+while True:
+    st = coll.advance_index("ts_region", budget=500)     # <= 500 units of work
+    if st.status == "ready":
+        break
+```
+
+* `register_index` takes one short transaction. It mints an immutable
+  `instance_id` and a resumable `build_id`, records the coverage start
+  `B = head`, and returns `building`. It does **no** baseline read or copy.
+* `advance_index(name, budget)` performs at most `budget` combined units:
+  baseline candidate reads count one each, catch-up journal rows count one
+  each. Progress and the work of the step are committed inside one short
+  transaction, so the build can be resumed by a different process and no
+  write lock outlives the call. After the call another process can always
+  publish the next `apply`.
+* The return value reports the step's `baseline_candidates_read` /
+  `catchup_changes_processed`, cumulative totals, the persisted baseline
+  cursor and `processed_seq` / `next_seq`, and on completion `ready_gen` (the
+  generation covered at the switch). `status` is `building` or `ready`.
+* Advancing an already-`ready` index is a no-op status read.
+
+**Correctness of backfill meeting corrections.** Baseline candidates are
+exactly the versions visible in some generation `>= B`: `cgen <= B AND
+(dgen IS NULL OR dgen > B)`. Every apply after registration writes, in its own
+commit, an `open` / `close` event per touched version into the per-instance
+journal. Baseline pagination is a keyset over `(key, rid, cgen)`, and a later
+apply only ever *closes* such a version with `dgen > B`, which never changes a
+version's key or removes it from the candidate set -- so nothing is skipped.
+Versions created after `B` enter only through the journal. The switch to
+`ready` commits only when the baseline is complete **and** every journal event
+below the current `next_seq` has been folded in, all inside the same write
+lock that publishes the ready flag. Thus an early baseline pass can never
+overwrite a committed update (opens of new versions are keyed by their own
+`cgen`; closes only set `dgen`), a late event cannot resurrect a deleted row
+(the close's `dgen` is honoured), and a change to a non-indexed column still
+opens a new version whose full main row is returned for its generation.
+
+## Reading through an index
+
+```python
+token = coll.begin_snapshot(gen)          # pin the read generation first
+page, stats, plan = coll.scan_index_page(
+    token, "ts_region",
+    {"shape": "prefix_range", "prefix": [["ts", 30]],
+     "range_column": "region", "lo": "c", "hi": "c"},
+    page_size=100,
+)
+page.rows                   # [((region, ts, note), b"row-id"), ...] full rows
+stats.index_candidates_examined   # secondary entries pulled from storage
+stats.invisible_versions_skipped
+stats.full_row_lookups            # main-version primary-key locators
+stats.rows_delivered              # final deliveries only
+stats.explain_query_plan          # SEARCH ... USING PRIMARY KEY on the entries
+```
+
+* The snapshot token still selects the generation; the index only changes the
+  access order. A token whose generation is below the index's `B` is refused
+  with `CoverageError` -- the main table is **never** silently scanned instead.
+  A token issued *before* the build finished works once the index is ready, as
+  long as its generation is `>= B` and still retained.
+* The scan is a concrete BLOB range seek on `(instance_id, index_key)` with
+  `ORDER BY index_key, cgen` -- the primary-key order, so it streams without a
+  temp sort and never decodes rows outside the intervals.
+* Each visible hit is located as an exact main version by the primary-key
+  point seek `(main_key, rid, main_cgen)`, so the full row is the row that
+  existed at the pinned generation -- never the current live row substituted
+  for history.
+* A pagination cursor binds, beyond the collection/snapshot/query/page-size
+  binding, the index **name**, the immutable **instance id**, the **declaration
+  hash**, and the last `(index_key, rid, cgen)`. Another index, a same-name
+  rebuild (new instance), the main ordering, or a different page size cannot
+  continue it. With `page_size=1` the equal-business-value siblings are still
+  delivered by their ascending row_id (the row_id is part of the key), so none
+  is skipped.
+
+A brand-new process needs only the collection path, snapshot token, index name,
+query and cursor:
+
+```bash
+python bytekey_cli.py index-range --collection warehouse.db --name ts_region \
+     --token "$SNAP" --query query.json --page-size 100 [--cursor "$CUR"]
+```
+
+## Retention, cancellation, deletion
+
+`collect_history(retain_from)` moves the retention boundary monotonically and
+now reclaims, with separate counts:
+
+* `entries_removed` -- main versions that lost every reader;
+* `secondary_entries_removed` -- secondary history items with the same rule;
+* `queue_entries_removed` -- stale journal rows.
+
+A *building* index protects its own inputs automatically: baseline candidates
+in the main store and its journal rows survive even if the user raises the
+retention boundary mid-build. You do **not** need to keep an extra snapshot
+alive for a build. Ready indexes keep only versions an active snapshot can
+still read, exactly like the main store. When a build finishes or is
+cancelled, its build-only material is released.
+
+* `cancel_index(name)` stops a `building` index and releases its build-only
+  material; the name becomes free.
+* `delete_index(name)` immediately retires a `building` or `ready` instance:
+  it can no longer advance or page, the name is free for a *different*
+  declaration, and old cursors (which carry the old instance id) are refused.
+  Deleting one index never disturbs another build, the main queries, batch
+  receipts or existing snapshots. File size is not required to shrink
+  immediately, and there is no automatic index chooser.
+
+## Formats and migration
+
+The collection format is now `bytekey-collection/v2`. An existing v1 file opens
+transparently: the first open runs a recoverable in-place upgrade inside one
+transaction that only adds the (empty) secondary tables and advances the
+marker. Collection identity, `head`, the original receipts and every existing
+snapshot token are preserved. If the upgrade is interrupted it simply runs
+again on the next open. Static index files are unchanged and stay read-only.
+
+Because applies read the set of `building` / `ready` indexes from the database
+*inside their own write transaction*, a writer connection opened **before** a
+registration still maintains the new index -- it can never skip maintenance
+based on a stale directory.
+
+## Secondary-index API summary
+
+```python
+from bytekey import (
+    SecondaryDeclaration, IndexColumn,
+    IndexDeclarationError, IndexNotFoundError, IndexNotReadyError,
+    IndexConflictError, IndexCursorError, CoverageError,
+)
+
+coll.register_index(decl_or_mapping, build_id=None)  # -> registration dict
+coll.advance_index(name, budget, expected_build_id=None)  # -> IndexBuildStatus
+coll.index_status(name) -> IndexBuildStatus
+coll.list_indexes(include_deleted=False) -> [IndexInfo]
+coll.scan_index_page(token, name, query, page_size, cursor_token=None)
+coll.explain_index_scan(name, query, page_size=100)
+coll.cancel_index(name); coll.delete_index(name, instance_id=None)
+```
+
+## Secondary-index commands
+
+```bash
+python bytekey_cli.py index-register --collection warehouse.db --declaration idx.json
+python bytekey_cli.py index-advance  --collection warehouse.db --name ts_region \
+     --budget 500 [--build-id HEX]
+python bytekey_cli.py index-status   --collection warehouse.db [--name ts_region]
+python bytekey_cli.py index-explain  --collection warehouse.db --name ts_region --query query.json
+python bytekey_cli.py index-range    --collection warehouse.db --name ts_region \
+     --token "$SNAP" --query query.json --page-size 100 [--cursor "$CUR"]
+python bytekey_cli.py index-cancel   --collection warehouse.db --name ts_region
+python bytekey_cli.py index-delete   --collection warehouse.db --name ts_region
+```
+
+Errors name the offending index/build or credential and exit nonzero (2).
+
+## Demonstration
+
+`demo/demo_secondary.py` reproduces the mandated fixture from real files
+(reopened between steps): a region-priority generation 0, a `ts DESC, region
+ASC` index advanced with budget 1, mid-build corrections, and a non-indexed
+`note` change, then pages the full rows for the build-start and later
+snapshots. It also runs a ts-only index (region change still surfaces), an
+operational tour (pre-opened writer, retention during a build, cancel, and a
+same-name rebuild that rejects the old cursor), and writes a bounded JSON
+report with the query plan and access counts:
+
+```bash
+python3 -I demo/demo_secondary.py       # writes demo/secondary_report/report.json
+```
+
+## Secondary-index tests
+
+```bash
+python3 -I tests/test_secondary_index.py   # mandated fixture, cursors, lifecycle,
+                                           # migration, merge invariants, crashes
+python3 -I tests/test_secondary_random.py  # randomized multi-index differential
+python3 -I tests/test_secondary_large.py   # budget bounds, narrow seek, no rebuild
+python3 -I tests/test_collection_cli.py    # CLI index lifecycle and failure exits
+```
+
+The randomized suite covers `None`, empty strings, and zero/NUL/0xFF bytes in
+the indexed and non-indexed columns, with every ready index drained against
+the independent, encoder-free reference model for every generation.
+
 
